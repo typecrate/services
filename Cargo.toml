@@ -1,0 +1,129 @@
+# =============================================================================
+# typecrate-services - the Rust core behind the `@typecrate/services` npm package.
+#
+# WHY an explicit `[workspace]` table HERE (and not a crate under root `rust/crates`):
+# the package was requested at packages/typecrate/services, and the root workspace
+# (Cargo.toml) only globs `members = ["rust/crates/*"]`. Without a `[workspace]`
+# boundary cargo walks up, finds the root workspace, and fails with
+# "current package believes it's in a workspace when it's not". Declaring the
+# boundary here keeps the requested npm location and leaves the root workspace
+# untouched - the same shape packages/underload/nexus already uses.
+#
+# What is still inherited from the repo root (cargo config discovery walks up from
+# the cwd, independently of workspace membership - see three levels up,
+# ../../../.cargo/config.toml):
+#   target-dir = ".rust/target"          -> artifacts stay inside the repo
+#   [env] TMP/TEMP/TMPDIR = Temp/rust    -> child processes never touch OS temp
+#   wasm32-unknown-unknown rustflags -C target-feature=+simd128
+#   rust-toolchain.toml channel 1.99.1   -> pinned toolchain + wasm target
+#
+# One combined crate on purpose: the native core and its wasm boundary are the
+# same code, and the wasm-only dependency is target-gated below, so a host build
+# never compiles wasm-bindgen. Splitting core/wasm into two crates buys nothing at
+# this size - the native runtime deps (axum/tokio) are target-gated the SAME way,
+# so a wasm32 build compiles neither the server module nor the HTTP stack, and the
+# artifact stays exactly as small as it was before a server existed.
+# =============================================================================
+
+[workspace]
+# 3 = the edition-2024 default (matches the root workspace): per-target feature
+# resolution, which is what makes the target-gated wasm dependency below cheap.
+resolver = "3"
+
+[package]
+name = "typecrate-services"
+# Crate name == npm name with `@` dropped and `/` replaced by `-`
+# (naming rule in ../../../rust/README.md "Name mapping rule").
+version = "1.0.2"                                  # mirrors the npm line in package.json
+edition = "2024"
+rust-version = "1.99"                              # same floor as the root workspace
+license = "MIT"
+publish = false                                    # crates.io: consumed by path, not published
+description = "Rust-native core for @typecrate/services, with an optional wasm32 boundary for JS hosts."
+
+[lib]
+name = "typecrate_services"                        # in Rust code: `use typecrate_services::...`
+path = "src/lib.rs"
+# cdylib  -> the wasm32 artifact wasm-bindgen post-processes (a native cdylib is
+#            simply an extra dll, harmless and required to share one manifest).
+# rlib    -> native consumers (crate-to-crate linking, the default path) and `cargo test`.
+crate-type = ["cdylib", "rlib"]
+
+# The native HTTP executable (R1). Declared explicitly so the artifact/bin name is
+# stable and greppable (`cargo run --bin typecrate-services-server`) instead of
+# cargo's autodiscovered `server`; naming a path here is also what stops
+# autodiscovery from creating a second target for the same file.
+# On wasm32 this same bin target is still built (build:wasm has no --lib), so
+# src/bin/server.rs keeps a cfg'd stub `main` and only links the runtime natively.
+[[bin]]
+name = "typecrate-services-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+# Ungated dependencies stay EMPTY on purpose: the pure core (identity/echo) must
+# compile for wasm32 with nothing but wasm-bindgen. Everything the native runtime
+# needs is target-gated below.
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# Compiled only for the wasm boundary, mirroring the root workspace's rule for
+# wasm-bindgen/js-sys/console_error_panic_hook (Cargo.toml "wasm boundary").
+wasm-bindgen = "0.2"
+
+# ---------------------------------------------------------------------------
+# Native runtime (the primary path), gated OFF wasm32 with the exact inverse of
+# the wasm-bindgen gate above: tokio's IO/time drivers and hyper's sockets do not
+# exist on wasm32-unknown-unknown, and `src/lib.rs` compiles `pub mod server` plus
+# the generated route table only when this cfg holds.
+#
+# Versions/features mirror packages/underload/nexus (crates/nexus-server) so the
+# repo resolves one axum/tokio/serde/reqwest graph, not two parallel ones.
+# ---------------------------------------------------------------------------
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+# `json` + `query` are the extractors the service endpoints actually use (POST JSON
+# bodies, GET query strings); axum's default features already bring http1 + tokio,
+# which is what `axum::serve` in src/bin/server.rs needs. `ws` is deliberately not
+# enabled - this package speaks request/response HTTP only.
+axum = { version = "0.8", features = ["json", "query"] }
+# Multi-thread runtime + macro support for `#[tokio::main]`/`#[tokio::test]`, the
+# listener, timeouts (test shutdown), and ctrl_c/SIGTERM for graceful shutdown.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+# Derives for the endpoint request/response DTOs in the generated route files.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
+# tests/server_http.rs dials the real listener over a real TCP socket; no stubbed
+# transport. No TLS feature: every test URL is http://127.0.0.1:<ephemeral>.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# `ignore` is a BUILD dependency for build.rs, but tests/discovery.rs (T11) compiles
+# `build_support/` into the TEST crate with `#[path]` (a build script has no rlib an
+# integration test can link), and a build-dependency is not visible to any other
+# target - so the same version is declared here too, for native test builds.
+# Same target gate as reqwest: tests/discovery.rs is `#![cfg(not(wasm32))]`, so the
+# wasm `--all-targets` check never sees this crate.
+ignore = "0.4"
+
+[build-dependencies]
+# Owned by the build-time scanner in build.rs (T11): `ignore` walks the tree with
+# .gitignore/.ignore semantics, which is how the Rust discovery matches the TS
+# endpoint scanner instead of re-implementing gitignore by hand.
+ignore = "0.4"
+
+# Lint policy copied from the root workspace ([workspace.lints]) because a
+# standalone workspace does not inherit another workspace's lint table.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Release profile mirrors the root workspace ([profile.release]): this workspace is
+# separate, so the settings have to be restated for the wasm artifact to be small.
+# panic = "abort": wasm32-unknown-unknown is abort-only (unwinding needs nightly);
+# cargo still forces unwind for the test profile, so assertions report normally.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

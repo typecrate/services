@@ -1,0 +1,70 @@
+{
+    "name": "@typecrate/services",
+    "version": "1.0.2",
+    "description": "Rust-native service core for the TypeCrate scope: a native HTTP executable whose routes are discovered at build time, plus the wasm-bindgen glue and generated TypeScript declarations that form the published npm artifact.",
+    "type": "module",
+    "#identity": "The package stays at packages/typecrate/services and keeps its npm name/version. The Rust crate is `typecrate-services` (crate name == npm name with @ dropped and / replaced by -, per rust/README.md), version pinned to the same 1.0.2 line; src/lib.rs asserts the two agree.",
+    "#layout": "Rust-first: Cargo.toml is a standalone Cargo workspace (explicit [workspace] boundary, so the root rust workspace stays untouched) with one combined crate. Native is the default path for build/check/test/lint - no JS tooling is involved. WASM is opt-in via build:wasm and stays the secondary target: the npm entry points still resolve to the generated glue, while the native server runs from this repository through cargo.",
+    "#native": "R1: `cargo build` (default member, no --lib) now produces BOTH the rlib/cdylib and the native HTTP executable `.rust/target/<profile>/typecrate-services-server.exe`; `start` / `run-native` run it, and everything after `--` is forwarded to the bin (cargo needs the bare `--` separator, which is harmless when no flags follow). Defaults: bind 0.0.0.0:5001 (every interface, so other devices on the LAN can reach the server - the same surface the TS gateway publishes; `--addr 127.0.0.1` / TYPECRATE_SERVICES_ADDR=127.0.0.1:5001 is the opt-in loopback-only start), writable data root <repo-parent>/temporary/dump (the same dump boundary the TS service uses), 1 MiB request body cap. The framework itself reserves four paths in the router: the embedded interactive playground at GET / (same origin, no external assets) plus its two embedded assets GET /playground.css and GET /playground.js, and the JSON endpoint listing at GET /v1/services/routes; endpoint files must not register any of them (one that does makes the router panic at startup instead of shadowing a builtin). The startup banner therefore prints the loopback URLs for this machine (0.0.0.0 is a bind answer, not a URL) plus the LAN address it detected and the trusted-LAN caveat: binding is only half of cross-device reachability - Windows Firewall, the network profile and routing decide whether another device gets in, the process never changes the firewall or any global network setting, and there is no auth or CORS gate yet, so this belongs on a trusted LAN and not on the public internet. Override with --addr/--port/--database-root or TYPECRATE_SERVICES_ADDR / TYPECRATE_SERVICES_DATABASE_ROOT; exit codes are 0 clean shutdown, 1 cannot serve, 2 bad usage. Routes are compiled in at build time from `*-route.rs` files (build.rs), so the scan root and the data root are different directories by design.",
+    "#verify": "`verify` is the native gate (fmt:check + lint:strict + test + release build of the server). The WASM chain is the secondary regression gate and lives in `verify:wasm` (wasm:check + build:wasm + smoke:wasm) because it needs the wasm-bindgen CLI at the lockfile version; native work must not be blocked by that tool boundary. `check:ui` is a third, optional surface for the embedded browser tool (see `#check-ui`): it stays outside `verify`, which must remain JS-free.",
+    "#check-ui": "`check:ui` runs `scripts/check-playground.mjs`: jsdom loads the real `src/server/playground.html`, evaluates the real `playground.js`, and drives the composer (listing -> selection -> path params/query/headers/body -> dispatch), including the request-body trim, prototype-colliding header names (`constructor`, `__proto__`), and every failure state (4xx, no response, cancel, the 30s watchdog, and a listing that failed to load - whose precise reason must survive a filter keystroke and recover through its in-place Try again button). Default mode is hermetic: the transport answers with fixtures whose bodies/statuses/rejection texts are exactly the ones this crate's endpoints produce. `--base http://127.0.0.1:5001` runs the identical suite against a running server and additionally asserts the served asset bytes equal the files on disk. jsdom comes from the workspace root - this package declares no dev dependency and installs nothing - and when jsdom cannot be resolved the check reports a skip instead of failing.",
+    "#entrypoints": "main/types/exports point at generated files: `scripts/build-wasm.mjs` runs cargo (wasm32-unknown-unknown) then `wasm-bindgen --target web --out-name typecrate_services`, which writes pkg/typecrate_services.js (ESM glue, the `import` condition), pkg/typecrate_services.d.ts (generated declarations, the `types` condition) and pkg/typecrate_services_bg.wasm. `prepack` runs that build, so `npm pack`/publish cannot ship entry paths that do not exist; pkg/ itself is git-ignored, hence a fresh clone needs `npm run build:wasm` before the entrypoints resolve.",
+    "main": "./pkg/typecrate_services.js",
+    "types": "./pkg/typecrate_services.d.ts",
+    "exports": {
+        ".": {
+            "types": "./pkg/typecrate_services.d.ts",
+            "import": "./pkg/typecrate_services.js"
+        }
+    },
+    "files": [
+        "pkg",
+        "scripts",
+        "examples",
+        "README.md"
+    ],
+    "publishConfig": {
+        "access": "public",
+        "registry": "https://registry.npmjs.org"
+    },
+    "scripts": {
+        "#rust": "Every script below except build:wasm/smoke:wasm/verify:wasm is native cargo on the toolchain pinned by rust-toolchain.toml (1.99.1, wasm32-unknown-unknown). Artifacts land in the repo-root .rust/target because ../../../.cargo/config.toml sets target-dir; cargo picks that config up by walking up from this directory. `build` has no --lib, so the default member builds the rlib/cdylib AND the typecrate-services-server executable.",
+        "#discover": "R1/T14: build, start, run-native, check and test start with `node scripts/discover-services.mjs`, the no-dependency pre-step that keeps new endpoint FOLDERS discoverable. build.rs watches the endpoint trees that produced routes plus each route file and the ignore files above them (cargo's only directory watch is recursive and ignores the scanner's prune rules, so watching the scan root would watch .rust/target and make every build dirty). The pre-step snapshots the tree shape into <repo>/Temp/typecrate-services/route-discovery.json - one watched file, never a directory - and rewrites it only when that shape changes, which is what makes `npm run build` pick up a brand-new endpoint/ tree. A new route file or subdirectory INSIDE a tree that already has routes needs no pre-step at all: that tree is already a watched directory. Bare cargo runs use the same mechanisms - see README 'Rebuild tracking' for the exact matrix and for the TYPECRATE_SERVICES_RESCAN escape hatch.",
+        "#locked": "cargo build/check/test/clippy run with --locked: Cargo.lock is committed for this standalone workspace, so the dependency graph - including the wasm-bindgen version whose CLI the glue must match exactly - can never be silently re-resolved by an npm script. If the lock is deleted or predates a manifest change, cargo stops; regenerate deliberately with `cargo generate-lockfile` and commit it. `fmt`/`fmt:check` take no lock part, and `discover` takes no cargo part.",
+        "#lint-vs-lint-strict": "`lint` is what root `turbo run test` executes (turbo test dependsOn lint), so it must not deny warnings; `lint:strict` is the -D warnings gate used by verify and CI. The build-time generated module is `include!`d into the crate, so it is linted like hand-written code - which is why build_support/emit.rs never emits a trailing `let ... ; router` (clippy::let_and_return) and why it emits `#[allow(non_snake_case)]` on the module declarations whose identifier comes from a digit-leading or capitalised path segment (rustc's non_snake_case rejects `a__b` and any capital, and a path like `endpoints/2024/` sanitises to exactly that).",
+        "#passthrough": "`start` (and its explicit alias `run-native`) end in a bare `--` so npm's own `--` separator forwards flags to the executable: `npm start -- --port 4321 --database-root D:/data`. npm appends the forwarded flags to the end of the script string, which is after the `node scripts/discover-services.mjs &&` pre-step, so the pre-step never swallows them. Flags: -a/--addr, --port, --database-root, -h/--help; env: TYPECRATE_SERVICES_ADDR, TYPECRATE_SERVICES_DATABASE_ROOT (CLI > env > built-in default). Nothing is ever killed: binding an address that is already taken is exit 1 with a message. Only THAT address and port conflict - on Windows a specific-address bind can still start beside a listener holding the wildcard on the same port (the more specific socket then wins that interface), so parallel instances want distinct --port values.",
+        "discover": "node scripts/discover-services.mjs",
+        "build": "node scripts/discover-services.mjs && cargo build --release --locked",
+        "start": "node scripts/discover-services.mjs && cargo run --bin typecrate-services-server --locked --",
+        "run-native": "node scripts/discover-services.mjs && cargo run --bin typecrate-services-server --locked --",
+        "check": "node scripts/discover-services.mjs && cargo check --workspace --all-targets --locked",
+        "check:ui": "node scripts/check-playground.mjs",
+        "test": "node scripts/discover-services.mjs && cargo test --workspace --locked",
+        "lint": "cargo clippy --workspace --all-targets --locked",
+        "lint:strict": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+        "fmt": "cargo fmt --all",
+        "fmt:check": "cargo fmt --all -- --check",
+        "wasm:check": "cargo check --target wasm32-unknown-unknown --all-targets --locked",
+        "build:wasm": "node scripts/build-wasm.mjs",
+        "smoke:wasm": "node examples/node-smoke.mjs",
+        "prepack": "npm run build:wasm",
+        "verify": "npm run fmt:check && npm run lint:strict && npm run test && npm run build",
+        "verify:wasm": "npm run wasm:check && npm run build:wasm && npm run smoke:wasm",
+        "release": "vite-node ../../../scripts/publish-safe.ts"
+    },
+    "keywords": [
+        "typecrate",
+        "rust",
+        "http",
+        "server",
+        "axum",
+        "wasm",
+        "webassembly",
+        "wasm-bindgen"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
+    "author": "NQQT",
+    "license": "MIT"
+}

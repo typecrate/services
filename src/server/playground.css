@@ -1,0 +1,710 @@
+/*
+ * Playground styles for `typecrate-services` (T18).
+ *
+ * Served as an embedded `include_str!` asset at `/playground.css` (see
+ * `src/server/mod.rs`). Constraints this file is written against:
+ *   * no stylesheet imports, no web fonts, no external URLs - the CSP is `style-src 'self'`
+ *     and the page must work with no network beyond the service itself;
+ *   * layout is one grid with three explicit breakpoints (stacked < 900px,
+ *     two columns >= 900px, three columns >= 1280px);
+ *   * every colour comes from a custom property so the dark scheme is a single
+ *     block, and focus is always visible (the playground is keyboard-first).
+ */
+
+:root {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --panel-alt: #f0f2f6;
+    --border: #d6dbe4;
+    --border-strong: #aab3c2;
+    --text: #1b2130;
+    --text-soft: #55607a;
+    --accent: #2f5fd0;
+    --accent-soft: #e6edfb;
+    --ok: #1f7a4d;
+    --ok-soft: #e2f3ea;
+    --warn: #8a5a00;
+    --warn-soft: #fdf1dc;
+    --err: #a12626;
+    --err-soft: #fbe6e6;
+    --radius: 8px;
+    --gap: 14px;
+    --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #12161f;
+        --panel: #1a2029;
+        --panel-alt: #222a36;
+        --border: #313c4c;
+        --border-strong: #4a5768;
+        --text: #e8ecf3;
+        --text-soft: #a4afc2;
+        --accent: #7ea2ff;
+        --accent-soft: #22304b;
+        --ok: #63c392;
+        --ok-soft: #1d3327;
+        --warn: #d9b25a;
+        --warn-soft: #33290f;
+        --err: #f08c8c;
+        --err-soft: #3a1d1d;
+    }
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.45 var(--sans);
+    /* Two extra rows so the footer never sits above the fold on a short window. */
+    min-height: 100vh;
+}
+
+/* ---------------------------------------------------------------- keyboard */
+
+.skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    background: var(--accent);
+    color: #fff;
+    padding: 8px 12px;
+    border-radius: 0 0 var(--radius) 0;
+    z-index: 2;
+}
+
+.skip-link:focus {
+    left: 0;
+}
+
+:where(a, button, input, textarea, select, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.visually-hidden {
+    position: absolute;
+    left: -9999px;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+}
+
+/* ------------------------------------------------------------------ header */
+
+.topbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 14px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.brand-mark {
+    font: 600 13px/1 var(--mono);
+    padding: 8px 9px;
+    border-radius: var(--radius);
+    background: var(--accent);
+    color: #fff;
+}
+
+.brand-text h1,
+.brand-text p {
+    margin: 0;
+}
+
+.brand-text h1 {
+    font-size: 17px;
+    letter-spacing: 0.01em;
+}
+
+.brand-sub {
+    color: var(--text-soft);
+    font-size: 13px;
+}
+
+.topbar-note {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--text-soft);
+}
+
+/* ------------------------------------------------------------------- grid */
+
+.layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--gap);
+    padding: var(--gap) 20px 24px;
+    align-items: start;
+    max-width: 1700px;
+}
+
+/* Two columns: the endpoint rail keeps a fixed width and scrolls on its own,
+   so a long route table cannot stretch the composer. */
+@media (min-width: 900px) {
+    .layout {
+        grid-template-columns: 300px minmax(0, 1fr);
+        grid-template-rows: auto auto;
+    }
+
+    .nav-panel {
+        grid-column: 1;
+        grid-row: 1 / span 2;
+        position: sticky;
+        top: var(--gap);
+        max-height: calc(100vh - 2 * var(--gap));
+        overflow: auto;
+    }
+
+    .composer {
+        grid-column: 2;
+        grid-row: 1;
+    }
+
+    .response-panel {
+        grid-column: 2;
+        grid-row: 2;
+    }
+}
+
+/* Three columns: composer and response side by side, which is the shape most
+   desktop use wants (edit on the left, read the answer on the right). */
+@media (min-width: 1280px) {
+    .layout {
+        grid-template-columns: 300px minmax(0, 1fr) minmax(0, 1fr);
+        grid-template-rows: auto;
+    }
+
+    .nav-panel,
+    .composer,
+    .response-panel {
+        grid-column: auto;
+        grid-row: 1;
+    }
+
+    .response-panel {
+        position: sticky;
+        top: var(--gap);
+        max-height: calc(100vh - 2 * var(--gap));
+        overflow: auto;
+    }
+}
+
+/* ----------------------------------------------------------------- panels */
+
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+}
+
+.panel-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.panel-title {
+    margin: 0;
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-soft);
+}
+
+.panel-subtitle {
+    margin: 0;
+    font-size: 12.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-soft);
+}
+
+.count {
+    font: 12px/1.4 var(--mono);
+    color: var(--text-soft);
+}
+
+.hint {
+    margin: 6px 0 10px;
+    font-size: 12.5px;
+    color: var(--text-soft);
+}
+
+.state {
+    margin: 10px 0;
+    font-size: 13px;
+    color: var(--text-soft);
+}
+
+.state[data-tone="error"] {
+    color: var(--err);
+}
+
+.state[data-tone="busy"] {
+    color: var(--warn);
+}
+
+/* ------------------------------------------------------------------ forms */
+
+.field-label {
+    display: block;
+    margin: 10px 0 4px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-soft);
+}
+
+.field {
+    display: block;
+    width: 100%;
+    padding: 8px 10px;
+    font: inherit;
+    color: var(--text);
+    background: var(--panel-alt);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+}
+
+.field:focus {
+    border-color: var(--accent);
+}
+
+/* Read-only mirrors of the selected endpoint: selectable text, no editing. */
+.field-readonly {
+    font-family: var(--mono);
+    font-size: 13px;
+    background: var(--panel);
+    border-style: dashed;
+    cursor: default;
+}
+
+.code-area {
+    font-family: var(--mono);
+    font-size: 13px;
+    resize: vertical;
+    min-height: 120px;
+    white-space: pre;
+}
+
+.field[aria-invalid="true"],
+.is-invalid {
+    border-color: var(--err);
+    background: var(--err-soft);
+}
+
+.row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.cell {
+    flex: 1 1 220px;
+    min-width: 0;
+}
+
+.cell-tight {
+    flex: 0 0 110px;
+}
+
+.summary {
+    margin: 10px 0 0;
+    font-size: 13px;
+    color: var(--text-soft);
+}
+
+.fieldset {
+    margin: 14px 0 0;
+    padding: 4px 12px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+
+.fieldset legend {
+    padding: 0 6px;
+    font-size: 12.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-soft);
+}
+
+/* Key/value rows are created by playground.js (createElement + textContent). */
+.kv-rows {
+    display: grid;
+    gap: 8px;
+    margin: 8px 0 4px;
+}
+
+.kv-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
+    gap: 8px;
+    align-items: center;
+}
+
+.kv-row .field {
+    min-width: 0;
+}
+
+/* Path parameters: a label above one input each, inside the same row grid. */
+.param-row {
+    display: grid;
+    gap: 2px;
+}
+
+.param-row .field-label {
+    margin: 2px 0 0;
+    font-family: var(--mono);
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: 0;
+}
+
+.link-button {
+    margin-top: 6px;
+    padding: 4px 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    font-size: 13px;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.remove-row {
+    padding: 6px 9px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--panel-alt);
+    color: var(--text-soft);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.remove-row:hover {
+    color: var(--err);
+    border-color: var(--err);
+}
+
+/* ---------------------------------------------------------------- buttons */
+
+.actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-top: 16px;
+}
+
+.primary,
+.ghost {
+    padding: 9px 16px;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.primary {
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #fff;
+    font-weight: 600;
+}
+
+.primary[disabled] {
+    opacity: 0.55;
+    cursor: progress;
+}
+
+.ghost {
+    border: 1px solid var(--border-strong);
+    background: var(--panel);
+    color: var(--text);
+}
+
+.ghost:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.actions-note {
+    font-size: 13px;
+    color: var(--text-soft);
+}
+
+.alert {
+    margin: 12px 0 0;
+    padding: 10px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    border: 1px solid transparent;
+}
+
+.alert-error {
+    background: var(--err-soft);
+    border-color: var(--err);
+    color: var(--err);
+}
+
+/* --------------------------------------------------------- endpoint rail */
+
+.endpoint-list {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+}
+
+.endpoint {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 4px 10px;
+    width: 100%;
+    padding: 8px 10px;
+    text-align: left;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+}
+
+.endpoint:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.endpoint[aria-current="true"] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.endpoint-path {
+    grid-column: 2;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    /* Path text is untrusted (it comes from the metadata route): it must wrap
+       inside the rail instead of widening it. */
+    overflow-wrap: anywhere;
+}
+
+.endpoint-summary {
+    grid-column: 2;
+    font-size: 12px;
+    color: var(--text-soft);
+    overflow-wrap: anywhere;
+}
+
+.badge {
+    grid-row: 1 / span 2;
+    align-self: start;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font: 600 11px/1.5 var(--mono);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    /* Neutral by design, and it stays the documented fallback: a verb without one of the
+       rules below (OPTIONS, TRACE, CONNECT, or anything a future route adds) renders
+       exactly like this, so every listed method is a readable badge and none is an
+       unstyled span. Nothing here is derived from server text except the `data-method`
+       name itself. */
+    background: var(--panel-alt);
+    color: var(--text-soft);
+    border: 1px solid var(--border-strong);
+}
+
+/* Method colour-coding is class-driven (no inline styles), which keeps the
+   page inside `style-src 'self'` and makes the badge readable in both schemes.
+   `head` shares the read colour with `get` on purpose: axum answers HEAD from the
+   same GET handler, so the rail must not make that route look like another verb. */
+.badge[data-method="get"],
+.badge[data-method="head"] {
+    background: var(--ok-soft);
+    border-color: var(--ok);
+    color: var(--ok);
+}
+
+.badge[data-method="post"] {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.badge[data-method="put"],
+.badge[data-method="patch"] {
+    background: var(--warn-soft);
+    border-color: var(--warn);
+    color: var(--warn);
+}
+
+.badge[data-method="delete"] {
+    background: var(--err-soft);
+    border-color: var(--err);
+    color: var(--err);
+}
+
+/* ---------------------------------------------------------------- response */
+
+.response-facts {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.status-pill {
+    padding: 3px 10px;
+    border-radius: 999px;
+    font: 600 12.5px/1.5 var(--mono);
+    border: 1px solid var(--border-strong);
+    background: var(--panel-alt);
+    color: var(--text-soft);
+}
+
+.status-pill[data-tone="ok"] {
+    background: var(--ok-soft);
+    border-color: var(--ok);
+    color: var(--ok);
+}
+
+.status-pill[data-tone="redirect"] {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.status-pill[data-tone="error"] {
+    background: var(--err-soft);
+    border-color: var(--err);
+    color: var(--err);
+}
+
+.status-pill[data-tone="info"] {
+    background: var(--warn-soft);
+    border-color: var(--warn);
+    color: var(--warn);
+}
+
+.fact {
+    font: 12.5px/1.5 var(--mono);
+    color: var(--text-soft);
+    overflow-wrap: anywhere;
+}
+
+.sub-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 14px 0 6px;
+}
+
+/* Response headers as a definition list: labels and values are both text. */
+.kv-list {
+    margin: 0;
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 4px 12px;
+    font: 12.5px/1.5 var(--mono);
+}
+
+.kv-list dt {
+    color: var(--text-soft);
+    overflow-wrap: anywhere;
+}
+
+.kv-list dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.code-block {
+    margin: 0;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--panel-alt);
+    font: 12.5px/1.5 var(--mono);
+    white-space: pre-wrap;
+    /* Long bodies scroll instead of pushing the page out of shape. */
+    max-height: 46vh;
+    overflow: auto;
+    overflow-wrap: anywhere;
+    tab-size: 2;
+}
+
+/* ------------------------------------------------------------------ footer */
+
+.foot {
+    padding: 0 20px 24px;
+    font-size: 12.5px;
+    color: var(--text-soft);
+}
+
+.foot code {
+    font-family: var(--mono);
+}
+
+/* Very narrow phones: the key/value grid would clip, so stack each row. */
+@media (max-width: 480px) {
+    .layout {
+        padding: 12px;
+    }
+
+    .panel {
+        padding: 12px;
+    }
+
+    .kv-row {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .remove-row {
+        justify-self: start;
+    }
+
+    .cell-tight {
+        flex-basis: 90px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    * {
+        transition: none !important;
+        animation: none !important;
+    }
+}

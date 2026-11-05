@@ -1,0 +1,158 @@
+<!doctype html>
+<!--
+  Interactive service playground for `typecrate-services` (T18).
+
+  Served by `src/server/mod.rs` as an embedded `include_str!` document, next to
+  `/playground.css` and `/playground.js` (the three files are one unit; the
+  response's Content-Security-Policy is written for exactly this shape, so there
+  is no inline script element, no inline style element, and no external or CDN
+  reference anywhere).
+
+  Untrusted data (the endpoint metadata and every response body) is inserted by
+  `playground.js` through `textContent`/`createElement` only, so markup in a
+  server-supplied string can never become an element here.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>typecrate-services playground</title>
+<!-- Data-URI favicon: the CSP allows `img-src 'self' data:` for exactly this. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%234c7dff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/playground.css">
+</head>
+<body>
+<a class="skip-link" href="#request-panel">Skip to the request composer</a>
+
+<header class="topbar">
+    <div class="brand">
+        <span class="brand-mark" aria-hidden="true">t/s</span>
+        <div class="brand-text">
+            <h1>typecrate-services</h1>
+            <p class="brand-sub">Service playground</p>
+        </div>
+    </div>
+    <p class="topbar-note" id="origin-note">Requests are same-origin only.</p>
+</header>
+
+<main class="layout">
+    <!-- Left rail: the discovered endpoint table (GET /v1/services/routes). -->
+    <section class="panel nav-panel" aria-labelledby="nav-heading">
+        <div class="panel-head">
+            <h2 id="nav-heading" class="panel-title">Endpoints</h2>
+            <span class="count" id="endpoint-count"></span>
+        </div>
+
+        <label class="field-label" for="endpoint-search">Search endpoints</label>
+        <input class="field" id="endpoint-search" type="search" placeholder="method, path or summary" autocomplete="off">
+        <p class="hint">Pick an endpoint to load it into the composer. Nothing is sent until you press Send.</p>
+
+        <!-- Loading / empty / error text for the list is one live region, so a
+             screen reader hears the state change instead of a silently empty list. -->
+        <p class="state" id="endpoint-state" role="status" aria-live="polite"></p>
+
+        <!-- A failed listing is recoverable without reloading the page: the precise
+             load error stays on screen and this button re-runs the one listing
+             request. A real <button> reusing `.link-button` (keyboard-visible focus,
+             Enter/Space for free) so the failed state needs no pointer at all. Hidden
+             by `playground.js` except while a load error is on screen. -->
+        <button class="link-button" id="reload-endpoints" type="button" hidden>Try again</button>
+
+        <ul class="endpoint-list" id="endpoint-list"></ul>
+    </section>
+
+    <!-- Middle: the request composer. A form so Enter submits from any field. -->
+    <section class="panel composer" id="request-panel" aria-labelledby="composer-heading">
+        <div class="panel-head">
+            <h2 id="composer-heading" class="panel-title">Request</h2>
+            <span class="count" id="composer-target"></span>
+        </div>
+
+        <p class="state" id="composer-state" role="status" aria-live="polite">Select an endpoint to begin.</p>
+
+        <form id="request-form" hidden>
+            <div class="row">
+                <div class="cell cell-tight">
+                    <label class="field-label" for="request-method">Method</label>
+                    <input class="field field-readonly" id="request-method" readonly tabindex="-1" value="">
+                </div>
+                <div class="cell">
+                    <label class="field-label" for="request-path">Path</label>
+                    <input class="field field-readonly" id="request-path" readonly tabindex="-1" value="">
+                </div>
+            </div>
+            <p class="summary" id="request-summary"></p>
+
+            <fieldset class="fieldset" id="path-param-group" hidden>
+                <legend>Path parameters</legend>
+                <div class="kv-rows" id="path-param-rows"></div>
+            </fieldset>
+
+            <fieldset class="fieldset">
+                <legend>Query parameters</legend>
+                <div class="kv-rows" id="query-rows"></div>
+                <button class="link-button" id="add-query" type="button">Add query parameter</button>
+            </fieldset>
+
+            <fieldset class="fieldset">
+                <legend>Headers</legend>
+                <div class="kv-rows" id="header-rows"></div>
+                <button class="link-button" id="add-header" type="button">Add header</button>
+            </fieldset>
+
+            <fieldset class="fieldset" id="body-group" hidden>
+                <legend>Body</legend>
+                <label class="field-label" for="request-body">Request body</label>
+                <textarea class="field code-area" id="request-body" rows="9" spellcheck="false" placeholder="{}"></textarea>
+                <p class="hint" id="body-hint"></p>
+            </fieldset>
+
+            <div class="actions">
+                <button class="primary" id="send" type="submit">Send request</button>
+                <button class="ghost" id="cancel" type="button" hidden>Cancel</button>
+                <button class="ghost" id="clear" type="button">Clear response</button>
+                <span class="actions-note" id="actions-note" role="status" aria-live="polite"></span>
+            </div>
+
+            <!-- Validation problems (bad path param, malformed JSON, illegal header)
+                 are reported here instead of silently changing the request. -->
+            <p class="alert alert-error" id="request-error" role="alert" hidden></p>
+        </form>
+    </section>
+
+    <!-- Right: what actually came back. Everything below is text, never markup. -->
+    <section class="panel response-panel" id="response-panel" aria-labelledby="response-heading">
+        <div class="panel-head">
+            <h2 id="response-heading" class="panel-title">Response</h2>
+            <span class="count" id="response-timing"></span>
+        </div>
+
+        <p class="state" id="response-state" role="status" aria-live="polite">No request has been sent yet.</p>
+
+        <div class="response-facts" id="response-facts" hidden>
+            <span class="status-pill" id="status-pill"></span>
+            <span class="fact" id="fact-url"></span>
+        </div>
+
+        <div class="sub-head" id="headers-head" hidden>
+            <h3 class="panel-subtitle">Response headers</h3>
+        </div>
+        <dl class="kv-list" id="response-headers" hidden></dl>
+
+        <div class="sub-head" id="body-head" hidden>
+            <h3 class="panel-subtitle">Response body</h3>
+            <span class="count" id="body-size"></span>
+        </div>
+        <!-- `pre` + textContent: JSON/HTML/error text is displayed verbatim. -->
+        <pre class="code-block" id="response-body" tabindex="0" hidden></pre>
+    </section>
+</main>
+
+<footer class="foot">
+    <p>Endpoint list, responses and errors come from <code>GET /v1/services/routes</code> and whatever you send; nothing is cached by this page.</p>
+</footer>
+
+<script src="/playground.js"></script>
+</body>
+</html>
