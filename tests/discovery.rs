@@ -973,6 +973,126 @@ fn the_generated_endpoint_listing_names_the_same_modules_in_the_same_order() {
     assert!(metadata.contains("pub fn route_metadata() -> Vec<crate::server::EndpointMeta> {"));
 }
 
+// ---------------------------------------------------------------------------
+// T6: the route tree that lives in ANOTHER package of the repository.
+// ---------------------------------------------------------------------------
+
+/// The `/v1/harness` bridge (`packages/typecrate/harness/endpoint/harness/harness-route.rs`) is the
+/// first route file discovered OUTSIDE this package, which is what makes the repository-root default
+/// (R2) load-bearing rather than incidental: a scan rooted at `packages/typecrate/services` compiles
+/// this crate happily and simply never mounts the harness.
+///
+/// Nothing here hardcodes the generated identifier - it is read out of the report and re-checked
+/// against the naming rules. What is asserted about the generated text is that the header map, the
+/// `#[path]` declaration, the `register_routes` chain and the `route_metadata` listing all name that
+/// one module, in the scanner's order. The route file's *contents* stay out of reach by design (the
+/// scanner never opens one), so the `/v1/harness` rows themselves are pinned over a socket by
+/// `tests/server_http.rs` and `tests/harness_gateway.rs`.
+#[test]
+fn the_harness_bridge_in_another_package_is_discovered_and_registered() {
+    // The scan-root-relative path, i.e. the sort key AND the identity this test is about.
+    const HARNESS_ROUTE: &str = "packages/typecrate/harness/endpoint/harness/harness-route.rs";
+
+    // The default root, resolved exactly as `build.rs` resolves it with no env override.
+    let root =
+        resolve_route_root(Path::new(MANIFEST_DIR), None).expect("the default root is usable");
+    let report = scan_routes(&ScanOptions { root: root.clone() })
+        .unwrap_or_else(|error| panic!("the repository root must scan cleanly: {error}"));
+
+    let harness = report
+        .routes
+        .iter()
+        .find(|route| route.relative_path == HARNESS_ROUTE)
+        .unwrap_or_else(|| {
+            panic!(
+                "`{HARNESS_ROUTE}` is not discovered; the scan found {:?} under {}",
+                report
+                    .routes
+                    .iter()
+                    .map(|route| route.relative_path.as_str())
+                    .collect::<Vec<_>>(),
+                report.root.display()
+            )
+        });
+
+    // The identifier is derived from the path, assigned for this report, and usable: `_`-joined,
+    // `-route` tail collapsed to `_route`, and clean enough that the strict lint gate needs no
+    // `#[allow(non_snake_case)]` on its declaration (F2).
+    assert_valid_identifier(&harness.module_name);
+    assert!(
+        harness.module_name.ends_with("_route"),
+        "the identifier keeps the `-route` half of its file name: {}",
+        harness.module_name
+    );
+    assert!(
+        !needs_snake_case_allow(&harness.module_name),
+        "the generated declaration for `{}` would need a lint allow",
+        harness.module_name
+    );
+    // The tree shape the rule needs: the singular `endpoint` alias, inside a sibling package, with
+    // the exact `-route.rs` suffix; and the absolute path really is that file.
+    assert_eq!(harness.root, root, "the report carries the root it scanned");
+    assert!(
+        harness.path.is_file(),
+        "the discovered route file exists: {}",
+        harness.path.display()
+    );
+    assert_eq!(
+        relative_path(&root, &harness.path).replace('\\', "/"),
+        HARNESS_ROUTE,
+        "the report's relative path is the on-disk path from the scan root"
+    );
+
+    // Deterministic order (R1): `packages/typecrate/h…` sorts before `packages/typecrate/s…`, so the
+    // bridge is registered FIRST - the exact order `tests/server_http.rs::route_table` pins.
+    assert_eq!(report.routes[0].relative_path, HARNESS_ROUTE);
+    let after_bridge: Vec<&str> = report
+        .routes
+        .iter()
+        .skip(1)
+        .map(|route| route.relative_path.as_str())
+        .collect();
+    assert_eq!(
+        after_bridge,
+        [
+            "packages/typecrate/services/examples/endpoints/echo/echo-route.rs",
+            "packages/typecrate/services/examples/endpoints/health/health-route.rs",
+            "packages/typecrate/services/examples/endpoints/locations/locations-route.rs",
+            "packages/typecrate/services/examples/endpoints/pets/pets-route.rs",
+        ],
+        "the bridge joined the sample set without reordering it"
+    );
+
+    // The generated module wires it up end to end.
+    let generated = generate_module(&report);
+    assert!(
+        generated.contains(&format!(
+            "//   {HARNESS_ROUTE} -> mod {}",
+            harness.module_name
+        )),
+        "the header must map the discovered path to the identifier it generated"
+    );
+    assert!(
+        generated.contains(&format!("\nmod {};", harness.module_name)),
+        "the route file must get its own `#[path]` module declaration"
+    );
+    let expected: Vec<&str> = report
+        .routes
+        .iter()
+        .map(|route| route.module_name.as_str())
+        .collect();
+    assert_eq!(
+        referenced_modules(generated_body(&generated), "::register(router)"),
+        expected,
+        "`register_routes` must chain every discovered module, in order"
+    );
+    assert_eq!(
+        referenced_modules(generated_metadata(&generated), "::ENDPOINTS"),
+        expected,
+        "`route_metadata` must list the same modules in the same order"
+    );
+}
+
 #[test]
 fn colliding_module_names_get_deterministic_numeric_suffixes() {
     let fixture = Fixture::new("colliding_module_names_get_deterministic_numeric_suffixes");

@@ -81,15 +81,35 @@ wasm-bindgen = "0.2"
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 # `json` + `query` are the extractors the service endpoints actually use (POST JSON
 # bodies, GET query strings); axum's default features already bring http1 + tokio,
-# which is what `axum::serve` in src/bin/server.rs needs. `ws` is deliberately not
-# enabled - this package speaks request/response HTTP only.
-axum = { version = "0.8", features = ["json", "query"] }
+# which is what `axum::serve` in src/bin/server.rs needs.
+#
+# `ws` is here for the harness gateway (T6): the discovered
+# `packages/typecrate/harness/endpoint/harness/harness-route.rs` module is compiled INTO this
+# crate, so axum is one build unit for both - and the `harness.v1` upgrade at
+# `/v1/harness/stream` needs `axum::extract::ws` to exist in it. Feature unification would
+# already pull it in through the harness path dependency, but stating it keeps this crate's own
+# surface honest: it does speak an upgrade now, not only request/response HTTP.
+axum = { version = "0.8", features = ["json", "query", "ws"] }
 # Multi-thread runtime + macro support for `#[tokio::main]`/`#[tokio::test]`, the
 # listener, timeouts (test shutdown), and ctrl_c/SIGTERM for graceful shutdown.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 # Derives for the endpoint request/response DTOs in the generated route files.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# T6: the `/v1/harness` gateway. `packages/typecrate/harness/endpoint/harness/harness-route.rs`
+# is a discovered route file, i.e. a module of THIS crate, and it calls
+# `typecrate_harness::api::{handle_request, handle_stream}` - so the harness library has to link
+# here. The edge points one way only: `typecrate-harness` has no dependency on services (its
+# manifest lists no path dependencies at all), so this cannot form a cycle.
+#
+# Same gate as every other line in this section, which is the exact inverse of the wasm-bindgen
+# gate above (`cfg(not(all(target_arch = "wasm32", target_os = "unknown")))`). It is the LONGER
+# spelling of the brief's `cfg(not(target_arch = "wasm32"))`, and it is the one this manifest
+# already uses: one gate table for the whole native runtime, and `cargo check --target
+# wasm32-unknown-unknown` still compiles neither the harness nor its axum/tokio/reqwest stack
+# (asserted by that check, and by `src/lib.rs` compiling `pub mod server` - the type the route
+# file names - under the same cfg).
+typecrate-harness = { path = "../harness" }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
 # tests/server_http.rs dials the real listener over a real TCP socket; no stubbed
@@ -102,6 +122,16 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # Same target gate as reqwest: tests/discovery.rs is `#![cfg(not(wasm32))]`, so the
 # wasm `--all-targets` check never sees this crate.
 ignore = "0.4"
+# tests/harness_gateway.rs (T6) completes the `harness.v1` handshake over the SAME router the
+# executable serves, which needs an RFC 6455 client. The same version the harness crate already
+# resolves for its own stream suite (`packages/typecrate/harness/Cargo.toml` dev-deps), and the
+# same target gate as reqwest above, so the wasm `--all-targets` check never sees this crate.
+tokio-tungstenite = "0.29"
+# `WebSocketStream` is a `futures` `Stream` + `Sink` (tokio-tungstenite 0.29 exposes no inherent
+# send/recv and re-exports nothing from futures), so the frame conversation needs these two extension
+# traits. Also already in the graph as a dependency of both axum and tokio-tungstenite, i.e. this
+# adds a dev-dependency line without adding a crate to the build.
+futures-util = "0.3"
 
 [build-dependencies]
 # Owned by the build-time scanner in build.rs (T11): `ignore` walks the tree with

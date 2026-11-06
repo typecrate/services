@@ -27,6 +27,13 @@
 //! `GET`/`PUT`/`PATCH`/`DELETE` of `{id}`. Those twelve are the crate's first endpoints that
 //! WRITE, so their half of this file also pins the store file they leave below the data root.
 //!
+//! Since T6 the generated table also carries the three `ANY` rows of the `/v1/harness` bridge
+//! (`packages/typecrate/harness/endpoint/harness/harness-route.rs`), registered FIRST because their
+//! route file sorts before every `examples/` tree. This file pins those rows as listing entries and
+//! as dispatches - the literal `ANY` verb, answered by the harness dispatcher - while the REST
+//! catalogue and the `harness.v1` upgrade behind them are proven end to end in
+//! `tests/harness_gateway.rs`.
+//!
 //! Compiled only for non-wasm targets: axum/tokio/reqwest are target-gated in
 //! `Cargo.toml`, so the crate root cfg below makes this an empty test crate for
 //! `cargo check --target wasm32-unknown-unknown --all-targets`.
@@ -1923,14 +1930,16 @@ async fn pets_list_ignores_every_query_parameter_it_does_not_declare() {
 /// below are what keep that claim true.
 const PLAYGROUND_CSP: &str = "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'";
 
-/// The whole listing, exactly as the generated table serialises it today: the fifteen sample
-/// endpoints, in order, with the summaries their route files author.
+/// The whole listing, exactly as the generated table serialises it today: the three `/v1/harness`
+/// rows plus the fifteen sample endpoints, in order, with the summaries their route files author.
 ///
 /// Two orders combine into this sequence, and both are pinned elsewhere:
 ///   * between files it is the scanner's registration order (byte-wise comparison
 ///     of the scan-root-relative path, `build_support/discovery.rs`, asserted in
-///     `tests/discovery.rs`), which puts `endpoints/echo/…` before `endpoints/health/…`,
-///     then `endpoints/locations/…` and finally `endpoints/pets/…`;
+///     `tests/discovery.rs`), which puts the FOREIGN tree
+///     `packages/typecrate/harness/endpoint/harness/harness-route.rs` (T6) ahead of this package's
+///     `packages/typecrate/services/examples/endpoints/echo/…`, then `endpoints/health/…`,
+///     `endpoints/locations/…` and finally `endpoints/pets/…`;
 ///   * inside one file it is the order the entries are written in
 ///     `crate::service_routes!` (`src/server/metadata.rs:128-160`), concatenated
 ///     verbatim by the generated `route_metadata` (`build_support/emit.rs:172-188`,
@@ -1946,6 +1955,25 @@ const PLAYGROUND_CSP: &str = "default-src 'self'; img-src 'self' data:; script-s
 /// or rewording a summary changes the listing, and the listing is asserted exactly.
 fn route_table() -> JsonValue {
     json!([
+        // T6: the `/v1/harness` bridge, registered FIRST because its route file lives in the
+        // harness package, and in the order that file's `crate::service_routes!` block declares
+        // them. `ANY` is the listing token of a verb-agnostic mount (`axum::routing::any`), not a
+        // wire verb - `src/server/metadata.rs`, "The `ANY` verb".
+        {
+            "method": "ANY",
+            "path": "/v1/harness",
+            "summary": "Underload harness service document",
+        },
+        {
+            "method": "ANY",
+            "path": "/v1/harness/stream",
+            "summary": "Underload harness realtime stream (harness.v1 WebSocket)",
+        },
+        {
+            "method": "ANY",
+            "path": "/v1/harness/{*rest}",
+            "summary": "Underload harness API resources",
+        },
         {
             "method": "POST",
             "path": "/v1/services/echo",
@@ -2024,7 +2052,8 @@ fn route_table() -> JsonValue {
     ])
 }
 
-/// The stand-in for every `{param}` in a listed template.
+/// The stand-in for every `{param}` in a listed template, including the harness catch-all's
+/// `{*rest}` (one segment is enough to address a concrete resource below the mount).
 const PARAM_PROBE_VALUE: &str = "probe";
 
 /// The `{id}` stand-in has to be a number, and `1` is the id the sample stores hand out first,
@@ -2315,8 +2344,8 @@ async fn routes_metadata_lists_exactly_the_generated_endpoints() {
     );
     assert_eq!(
         entries.len(),
-        15,
-        "the listing did not report the fifteen sample endpoints: {raw}"
+        18,
+        "the listing did not report the three harness rows plus the fifteen sample endpoints: {raw}"
     );
 
     // Built-ins are absent from their own listing by construction: the generated
@@ -2402,11 +2431,47 @@ fn dispatch(
     }
 }
 
-/// The fifteen rows of `route_table`, in that order, each with its contract answer.
-fn dispatch_plan() -> [Dispatch; 15] {
+/// The eighteen rows of `route_table`, in that order, each with its contract answer.
+///
+/// The three `ANY` rows come first, and they are dispatched with the LITERAL method the listing
+/// advertises: `axum::routing::any` matches every verb, so an `ANY` request really does reach the
+/// handler, and the answer is the harness dispatcher's own contract response for a verb that route
+/// does not declare (405, naming the allowed verbs) or for a path it does not know (404). The
+/// sentences are what make this a precedence proof as well as a dispatch proof: the two harness
+/// mounts answer the SAME wrong verb with two DIFFERENT messages, so a router that handed
+/// `/v1/harness/stream` to the catch-all would fail here instead of quietly passing.
+fn dispatch_plan() -> [Dispatch; 18] {
     let pets = pets();
     let locations = locations();
     [
+        // The harness bridge, in its route file's declaration order. No body: a wrong verb is
+        // refused before the body is read (the contract's laziness rule, `api.ts:4009`).
+        dispatch(
+            "ANY",
+            "/v1/harness",
+            None,
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            r#"{"error":{"message":"Use GET for /v1/harness."}}"#,
+            None,
+        ),
+        dispatch(
+            "ANY",
+            "/v1/harness/stream",
+            None,
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            r#"{"error":{"message":"The stream upgrade is a GET."}}"#,
+            None,
+        ),
+        // `{*rest}` gets its own stand-in below, so this row addresses a concrete unknown resource
+        // under the mount and the dispatcher's 404 names the request it could not route.
+        dispatch(
+            "ANY",
+            "/v1/harness/{*rest}",
+            None,
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"Unknown API route: ANY /v1/harness/probe"}}"#,
+            None,
+        ),
         dispatch(
             "POST",
             "/v1/services/echo",
@@ -2571,13 +2636,21 @@ async fn every_listed_endpoint_is_the_method_the_socket_dispatches() {
     for row in &plan {
         // The advertised verb is parsed from the advertised string, so an unusable method in
         // the listing is a loud failure here rather than a silently skipped row.
+        //
+        // `ANY` is no exception: it is a usable method token, `axum::routing::any` matches it, and
+        // the harness rows are therefore dispatched LITERALLY instead of being skipped - the
+        // contract answer each of them gets is spelled out per row in `dispatch_plan`.
         let label = format!("{} {}", row.method, row.template);
         let method = reqwest::Method::from_bytes(row.method.as_bytes())
             .unwrap_or_else(|err| panic!("the listing advertises an unusable method: {err}"));
         let concrete = row
             .template
             .replace("{value}", PARAM_PROBE_VALUE)
-            .replace("{id}", PARAM_PROBE_ID);
+            .replace("{id}", PARAM_PROBE_ID)
+            // The catch-all's stand-in: one segment, so `/v1/harness/{*rest}` becomes a concrete
+            // path (`/v1/harness/probe`) the harness dispatcher can answer, exactly as the `{id}`
+            // and `{value}` stand-ins turn their templates into real requests.
+            .replace("{*rest}", PARAM_PROBE_VALUE);
         let answer = send(&client, &server, method, &concrete, row.body).await;
         assert_eq!(
             answer.status, row.status,

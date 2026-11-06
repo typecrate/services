@@ -49,6 +49,12 @@ The one artifact outside the package is the discovery snapshot,
 `build.rs` watches so a new endpoint folder is picked up by the next `npm` run (see
 [Rebuild tracking](#rebuild-tracking-what-re-runs-the-scan-and-what-needs-a-re-scan)).
 
+One discovered **route tree lives outside this package**: the repository-root scan also finds
+`packages/typecrate/harness/endpoint/harness/harness-route.rs`, the `/v1/harness` bridge, which
+calls into the sibling `typecrate-harness` crate (a non-wasm path dependency). That is what makes
+the scan root the repository rather than this folder — see
+[Harness gateway](#harness-gateway-v1harness).
+
 `Cargo.toml` declares its own `[workspace]` on purpose: the package lives where the
 npm package lives (`packages/typecrate/services`), while the root workspace only
 globs `rust/crates/*`. The explicit boundary is what stops cargo from erroring
@@ -196,10 +202,11 @@ into the binary, so a cached copy is a different version of the tool),
 second origin — the playground therefore works on a LAN with no internet, and a
 response body full of markup is displayed as text rather than executed.
 
-The listing is the compiled-in set only, so today it is this package's fifteen sample
+The listing is the compiled-in set only, so today it is eighteen rows: the three `ANY`
+rows of the [harness gateway](#harness-gateway-v1harness) plus this package's fifteen sample
 routes — the two `echo` ones, `health`, and the six routes each REST sample compiles in
-(`locations` and `pets`, one row per `GET`/`POST`/`GET`/`PUT`/`PATCH`/`DELETE`) — the
-`@underload/service` endpoints are still only on the TS gateway. Its rows are
+(`locations` and `pets`, one row per `GET`/`POST`/`GET`/`PUT`/`PATCH`/`DELETE`). Every other
+`@underload/service` endpoint is still only on the TS gateway. Its rows are
 **generated**, not hand-maintained: each route file declares its endpoints once through
 `crate::service_routes!`, which emits both the `register` fn and that module's
 `ENDPOINTS` slice from the same tokens (see
@@ -215,7 +222,10 @@ split here one row per line so the whole set is readable, and every summary is v
 the text its route file declares:
 
 ```json
-[{"method":"POST","path":"/v1/services/echo","summary":"Echoes the posted `value` unchanged"},
+[{"method":"ANY","path":"/v1/harness","summary":"Underload harness service document"},
+{"method":"ANY","path":"/v1/harness/stream","summary":"Underload harness realtime stream (harness.v1 WebSocket)"},
+{"method":"ANY","path":"/v1/harness/{*rest}","summary":"Underload harness API resources"},
+{"method":"POST","path":"/v1/services/echo","summary":"Echoes the posted `value` unchanged"},
 {"method":"GET","path":"/v1/services/echo/{value}","summary":"Echoes `{value}`, with `?prefix=` applied"},
 {"method":"GET","path":"/v1/services/health","summary":"Reports the service name and version"},
 {"method":"GET","path":"/v1/services/locations","summary":"Lists every stored location, `?city=` narrows by exact city"},
@@ -233,11 +243,11 @@ the text its route file declares:
 ```
 
 The order is the scanner's byte-wise order of the route files, so
-`endpoints/echo/echo-route.rs` comes first, then `health-route.rs`, `locations-route.rs`
-and `pets-route.rs` — the `*-core.rs` files sitting next to them are never scanned, so they
-cannot change this order; inside one route file it is the order of the
-`crate::service_routes!` entries. And the set is not only prose:
-`scripts/check-playground.mjs` pins it row-by-row in rail order (`LISTING_JSON`), so
+`packages/typecrate/harness/endpoint/harness/harness-route.rs` comes first (T6), then
+`endpoints/echo/echo-route.rs`, `health-route.rs`, `locations-route.rs` and `pets-route.rs` — the
+`*-core.rs` files sitting next to them are never scanned, so they cannot change this order; inside
+one route file it is the order of the `crate::service_routes!` entries. And the set is not only
+prose: `scripts/check-playground.mjs` pins it row-by-row in rail order (`LISTING_JSON`), so
 `npm run check:ui -- --base <origin>` fails the moment a running server lists a different
 method, path or summary.
 
@@ -470,6 +480,116 @@ use typecrate_services::server::{AppState, app};
 let router = app(AppState::new("D:\\data"));   // axum::Router, ready for axum::serve
 ```
 
+## Harness gateway (`/v1/harness`)
+
+`@typecrate/harness` (`packages/typecrate/harness` — its own workspace, crate `typecrate-harness`)
+owns the ported `/v1/harness` control plane: the REST resources, the `harness.v1` WebSocket
+stream, and the store below the database root. That crate has no dependency on this one, and this
+one implements none of it — the bridge between them is **one discovered route file that lives in
+the harness package**:
+
+```text
+packages/typecrate/harness/endpoint/harness/harness-route.rs
+```
+
+The repository-root scan compiles it into this crate like any other route file (the `-route.rs`
+suffix inside an `endpoint` directory is the whole rule — see
+[Routes are compiled in at build time](#routes-are-compiled-in-at-build-time)), and what it
+contains is three handler wrappers plus one `crate::service_routes!` block: read
+`AppState::database_root`, hand the whole `axum::Request` to
+`typecrate_harness::api::handle_request` / `handle_stream`, return the `Response`. The harness
+resolves its own package root (`package_root.rs`, baked from its own `CARGO_MANIFEST_DIR`) and its
+own runtime per database root, so this gateway answers exactly what
+`cargo run --bin typecrate-harness-server` answers on the same directory.
+
+| Verb | Path | Handler | What it is |
+| --- | --- | --- | --- |
+| `ANY` | `/v1/harness` | `harness_root` | the boot document: `service`, `api_root`, `epoch`, `links`, capabilities, limits |
+| `ANY` | `/v1/harness/stream` | `harness_stream` | the `harness.v1` WebSocket mount |
+| `ANY` | `/v1/harness/{*rest}` | `harness_api` | every other mount-relative resource, including the harness's own `404`/`405`/`413`/`415` sentences |
+
+**`ANY` is a listing token, not a wire verb.** axum 0.8 has no `MethodFilter::Any` constant, so
+`crate::service_routes!` resolves the verb `ANY` to `axum::routing::any(handler)` and prints the
+literal `"ANY"` in `GET /v1/services/routes` (`src/server/metadata.rs`, "The `ANY` verb"). A mount
+registered that way asks no verb test at the router, which is exactly what the harness needs: its
+`405` names the allowed verbs of the route *it* matched, and the stream mount answers a `GET`
+without upgrade headers with its own contract `400`. `tests/server_http.rs` dispatches the literal
+`ANY` verb against all three rows, and `tests/harness_gateway.rs` proves the real verbs, the
+upgrade, and that the STATIC `/v1/harness/stream` wins over the `{*rest}` catch-all (the two
+handlers answer a wrong verb with two different sentences, so a precedence regression cannot hide
+behind a status code).
+
+The dependency is a **path dependency under the non-wasm gate**, next to axum/tokio/serde:
+
+```toml
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+typecrate-harness = { path = "../harness" }
+```
+
+so `npm run wasm:check` compiles neither the harness nor its axum/tokio/reqwest stack — on
+`wasm32-unknown-unknown` the generated table (and with it the route file) is not included at all.
+The edge points one way only: `typecrate-harness` declares no path dependencies, so there is no
+cycle. axum's `ws` feature is enabled here for the same reason — the discovered module and the
+harness library compile axum as one build unit, and `/v1/harness/stream` upgrades.
+
+```bash
+curl -s  http://127.0.0.1:5001/v1/harness            # the boot document
+curl -s  http://127.0.0.1:5001/v1/harness/health     # {"ok":true,"sessions":N,"epoch":"…"}
+curl -s  http://127.0.0.1:5001/v1/harness/sessions   # the paged collection (`items`/`limit`/…)
+curl -s  http://127.0.0.1:5001/v1/harness/tools      # the tool catalogue (`timeNow` is one row)
+curl -s -X POST -H 'content-type: application/json' \
+     -d '{"harness":"instruct"}' \
+     http://127.0.0.1:5001/v1/harness/sessions       # 201 + {"session":{…}}
+curl -s  http://127.0.0.1:5001/v1/services/routes    # the three `ANY` rows come FIRST
+```
+
+and the stream, on the same listener as everything else — the subprotocol has to be offered, the
+`101` echoes it and carries `X-Harness-Epoch`:
+
+```bash
+websocat -H 'Sec-WebSocket-Protocol: harness.v1' ws://127.0.0.1:5001/v1/harness/stream
+# → {"type":"welcome","protocol":"harness.v1","epoch":"…","limits":{…}}
+# → {"type":"subscribe","subscription_id":"s1","scope":"session","session_id":"<id>"}
+# → {"type":"subscription_state","subscription_id":"s1","epoch":"…",…}
+```
+
+A plain `GET /v1/harness/stream` with no upgrade headers is the contract's
+`400 GET /stream expects a WebSocket upgrade (Sec-WebSocket-Key/Version) for the harness.v1
+subprotocol.`, and any path under the mount that is not a resource is the harness's own
+`404 Unknown API route: …` — the catch-all hands over, it does not swallow.
+
+Because the harness tree is a **brand-new `endpoint` folder** outside every previously watched
+tree, adding it needed one explicit re-scan: `npm run discover` (the snapshot step every npm script
+already runs), or by hand `TYPECRATE_SERVICES_RESCAN=<anything> cargo build`. See
+[Rebuild tracking](#rebuild-tracking-what-re-runs-the-scan-and-what-needs-a-re-scan).
+`scripts/check-playground.mjs` pins the playground rail row by row (`LISTING_JSON`), so it has to
+carry these three rows too; that script is not part of the Rust gate.
+
+### Gateway headers, preflights and body limits
+
+`server::app` wraps the whole router in one outermost layer (`src/server/mod.rs::gateway`) that
+reproduces the middleware stack of the TS host
+(`packages/underload/service/src/server/start.ts:415-444`):
+
+- every response carries `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: *`,
+  `Access-Control-Allow-Headers: *` and `Access-Control-Allow-Private-Network: true`. Chrome
+  requires the last one on any preflight that targets a private/LAN address, and hono's `cors()`
+  does not emit it, which is why the TS host sets it in its own middleware;
+- a CORS **preflight** — an `OPTIONS` that carries `Access-Control-Request-Method` — is answered
+  with a header-only `204` before routing, exactly as hono's `cors()` does. A bare `OPTIONS`
+  without that header is still routed, so `OPTIONS /v1/services/pets` keeps the documented `405` +
+  `allow` and `OPTIONS /v1/harness` keeps the harness's own `Use GET for /v1/harness.`;
+- the pre-existing `DefaultBodyLimit::max(1 MiB)` layer is unchanged and still governs the
+  extractor endpoints. It does **not** clip the harness, because that layer applies to extractors
+  that ask for it and not to a handler that reads `Request` itself
+  (`axum-core-0.5.6/src/extract/default_body_limit.rs`): the harness keeps its own `1 000 000` byte
+  cap and its `16 MiB` cap on `POST /v1/harness/sessions/{id}/tasks`. All three behaviours are
+  pinned by `tests/harness_gateway.rs::the_gateway_body_cap_governs_extractors_not_the_harness_route`.
+
+The one TS behaviour that is **not** reproduced is the gateway's `307` worker-redirect tier: it
+exists because the TS host forks one worker process per endpoint group, while this router serves
+every route in the process that owns the listener. Bind addresses and ports are unchanged.
+
 ## Routes are compiled in at build time
 
 There is **no runtime route registry**. `build.rs` scans the tree for `*-route.rs` files
@@ -585,7 +705,7 @@ the route file carries the macro.
    the playground rail with nothing else touched.
 
 **What the split does not change is the wire surface.** The `*-route.rs` rename and the
-two-file layout are purely internal file organisation: the fifteen routes listed in
+two-file layout are purely internal file organisation: the eighteen routes listed in
 [Where the server answers](#where-the-server-answers), the listing endpoint itself, every
 method, path, status and summary, and every REST rule documented in
 [Endpoints as they behave on the wire](#endpoints-as-they-behave-on-the-wire) are identical
@@ -697,6 +817,16 @@ so a verb or a path cannot be renamed in one view and missed in the other: the m
 compile error on the route file), and the path literal is the same token in
 `.route(..)` and in `EndpointMeta::path`. Nothing in `build_support/` reads a route
 file's *contents*, so the listing is not a parse of the source.
+
+**`ANY` is the one entry that does not name a `MethodFilter`.** axum 0.8 has no
+`MethodFilter::Any` constant — its verb-agnostic mount is the free function
+`axum::routing::any` — so the macro resolves the verb through the crate-root helper
+`__service_route_method_router!`: `ANY` emits `axum::routing::any(handler)`, every other verb
+keeps `axum::routing::on(MethodFilter::<VERB>, handler)` byte-for-byte as before, and a file may
+mix the two. `stringify!(ANY)` is `"ANY"`, so the listing token still comes from the same entry;
+it means "every verb reaches this handler and the endpoint decides which ones it answers", which
+is what the [`/v1/harness` bridge](#harness-gateway-v1harness) needs (its `405` names the verbs of
+the route it matched, and the stream mount answers a verb-less upgrade itself).
 
 The macro has to be used from **inside this crate** (which is what every discovered route
 file is; the core file is only a submodule of it, so the macro never moves there), because
@@ -867,18 +997,27 @@ the support floor is Chrome 91+ / Firefox 90+ / Safari 16+ / Node 16+.
 
 This milestone is the framework, not the migration:
 
-- **No TypeScript endpoint has been ported.** The fifteen documented routes are the
-  package's own samples (`examples/endpoints/**`), and the two REST samples are toy CRUD
-  written to demonstrate the framework, not a port of anything: the `@underload/service`
-  catalogue (comfy, harness, database, preferences, …) still runs on the TS
-  gateway, which stays untouched.
+- **No TypeScript endpoint has been ported** except one. The fifteen `GET`/`POST`-style
+  documented routes are the package's own samples (`examples/endpoints/**`), and the two REST
+  samples are toy CRUD written to demonstrate the framework, not a port of anything. The
+  `@underload/service` catalogue (comfy, database, preferences, …) still runs on the TS gateway,
+  which stays untouched. `harness` is the exception: its Rust port lives in
+  `packages/typecrate/harness` and reaches the wire through the discovered bridge described in
+  [Harness gateway](#harness-gateway-v1harness) — the gateway serves `/v1/harness`, the TS harness
+  package is still its own host.
 - **Single port, single origin.** No multi-port gateway, no static-file mount or web
-  root (the playground page at `/` is embedded in the binary, not read from disk), no
-  streaming or websocket endpoints (`ws` is not even an enabled axum feature), and
-  no media/range serving.
-- **No security middleware yet**: no bearer/API-key auth, no Origin/CORS gate
-  (an `OPTIONS` preflight is a plain `405`), no rate limiting. Because the default
-  bind is `0.0.0.0`, "anything on the LAN can call this server" is the honest
+  root (the playground page at `/` is embedded in the binary, not read from disk), and no
+  media/range serving. The one streaming surface is the `harness.v1` WebSocket mount
+  (`axum`'s `ws` feature is enabled for it); there is no SSE and no chunked handler of this
+  package's own.
+- **No security middleware yet**: no bearer/API-key auth, no Origin **gate** (the request's
+  `Origin` is never validated, and no endpoint is refused because of it), no rate limiting. The
+  transport does publish the TS host's permissive CORS answer on every response —
+  `Access-Control-Allow-{Origin,Methods,Headers}: *` plus
+  `Access-Control-Allow-Private-Network: true` — and it answers a real preflight
+  (`OPTIONS` + `Access-Control-Request-Method`) with a header-only `204`; a bare `OPTIONS` is
+  still routed and is a plain `405` on a registered path. Because the default bind is `0.0.0.0`,
+  "anything on the LAN can call this server" is the honest
   description of the current posture: the body cap and the no-filesystem-path rule
   are what the code enforces, while *trusted network* is an operating assumption the
   operator keeps — `--addr 127.0.0.1` narrows it to this machine when that
@@ -893,9 +1032,12 @@ This milestone is the framework, not the migration:
   (`TYPECRATE_SERVICES_RESCAN`). This is a bounded trade-off, not full repository-wide
   directory tracking, and it is what keeps consecutive `cargo check`/`build`
   invocations `Fresh` instead of rebuilding on every call.
-- **`1 MiB` request bodies, JSON only.** No multipart or streaming handlers (the
-  axum features enabled here are `json` + `query`, and `ws` is off), no compression
-  layer, and HTTP/1.1 only — axum's default serve stack.
+- **`1 MiB` request bodies for the sample endpoints, JSON only.** No multipart or streaming
+  handlers of this package's own (the axum features enabled here are `json`, `query` and `ws`, the
+  last one for the harness mount), no compression layer, and HTTP/1.1 only — axum's default serve
+  stack. The `1 MiB` `DefaultBodyLimit` governs the extractor endpoints; the harness route is not
+  clipped by it and keeps its own `1 000 000` byte cap and its `16 MiB` submit cap (see
+  [Gateway headers, preflights and body limits](#gateway-headers-preflights-and-body-limits)).
 - **WASM does not serve.** On `wasm32-unknown-unknown` the server module and the
   generated table are compiled out, so the module keeps the
   `crateName`/`version`/`echo` boundary and its `main` is an empty stub.

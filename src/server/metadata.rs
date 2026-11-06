@@ -15,6 +15,25 @@
 //! (it only walks file names), so a renamed path segment cannot be "found" in one view and
 //! missed in the other; it is a single token used twice.
 //!
+//! # The `ANY` verb
+//!
+//! A verb name in the entry list is normally `axum::routing::MethodFilter::<VERB>`, and the
+//! listing prints `stringify!` of it. `ANY` is the one entry whose router half is NOT a
+//! `MethodFilter`: axum 0.8.9 defines no `MethodFilter::Any` constant (only `CONNECT`, `DELETE`,
+//! `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT`, `TRACE` - `src/routing/method_filter.rs:29-45`),
+//! and its verb-agnostic mount is the free function `axum::routing::any`
+//! (`src/routing/method_routing.rs:508`). [`service_routes!`] therefore resolves `ANY` through
+//! the crate-root helper macro `__service_route_method_router!`, which produces
+//! `axum::routing::any(handler)`; every other verb
+//! keeps the `MethodFilter` path unchanged. The metadata half needs no special case: the token
+//! `ANY` stringifies to `"ANY"`, which is the listing's method spelling for a mount that answers
+//! every verb and lets the endpoint itself decide the verb test.
+//!
+//! That is exactly what the `/v1/harness` bridge (`packages/typecrate/harness/endpoint/harness/
+//! harness-route.rs`, T6) needs: the harness dispatcher prints the 405 sentence naming the
+//! allowed verbs of the route IT matched, and the stream mount answers a `GET` that carries no
+//! upgrade headers with its own 400 - a router-level 405 would replace both.
+//!
 //! # What is NOT here
 //!
 //! * **No runtime registry / no mutable global.** `ENDPOINTS` is a `pub const` slice and the
@@ -81,6 +100,11 @@ pub struct EndpointMeta {
     /// Not a free string: [`service_routes!`] fills it with `stringify!` of the very
     /// identifier it uses for `axum::routing::MethodFilter::<METHOD>`, so an unknown verb
     /// fails to compile on the route file instead of being listed wrongly.
+    ///
+    /// `"ANY"` is the one value that is not a wire verb: it is the token of a verb-agnostic
+    /// mount (`axum::routing::any`), i.e. "every verb reaches this handler, and the endpoint
+    /// itself decides which ones it answers". The `/v1/harness` rows are the only ones written
+    /// that way, because the harness dispatcher owns its own 405 sentences (T6).
     pub method: &'static str,
 
     /// Route pattern exactly as handed to `Router::route`, `{param}` segments included
@@ -114,6 +138,11 @@ pub struct EndpointMeta {
 ///   `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT`, `TRACE`); the metadata uses
 ///   `stringify!(METHOD)`. Any other spelling is a compile error on the route file, so the
 ///   listing cannot be wrong about a verb it did compile with.
+/// * `ANY` is the one METHOD with no `MethodFilter` constant: it mounts
+///   `axum::routing::any(handler)` (see the module docs and
+///   [`__service_route_method_router!`]) and is listed as the literal `"ANY"`, because
+///   `stringify!(ANY)` is `"ANY"`. A verb-agnostic mount answers no verb test at the router, so
+///   the endpoint owns the 405/400 sentences - which is what the `/v1/harness` bridge needs.
 /// * `"route pattern"` is the literal handed to `Router::route` *and* the literal in
 ///   `EndpointMeta::path` - one token, two uses.
 /// * `handler` is a `path` fragment (`handler`, `self::handler`, `module::handler`): any axum
@@ -156,7 +185,7 @@ macro_rules! service_routes {
             $(
                 .route(
                     $path,
-                    axum::routing::on(axum::routing::MethodFilter::$method, $handler),
+                    $crate::__service_route_method_router!($method, $handler),
                 )
             )*
         }
@@ -174,6 +203,37 @@ macro_rules! service_routes {
                 summary: $summary,
             },
         )*];
+    };
+}
+
+/// Verb-to-`MethodRouter` resolution for one [`service_routes!`] entry, so the entry list stays
+/// the only place a verb is written while `ANY` and the nine `MethodFilter` verbs still mount
+/// through their own axum constructor.
+///
+/// Why a helper macro instead of one uniform expression: axum 0.8.9 has no
+/// `MethodFilter::Any` constant to plug into `axum::routing::on(..)` - its verb-agnostic mount is
+/// the free function `axum::routing::any` (`src/routing/method_routing.rs:508`). One expression of
+/// the `on(..)` shape cannot cover both entries, because `ANY` names a function rather than a
+/// constant.
+///
+/// Matching the literal `ANY` first and falling through to the `$method:ident` arm keeps every
+/// existing verb's emitted code byte-identical, supports a mixed list (`ANY` next to `GET` in one
+/// file), and leaves the failure mode unchanged: an unknown verb is still a compile error on the
+/// route file, at the `MethodFilter::NOPE` path, never a wrong listing row.
+///
+/// `#[doc(hidden)]` + `#[macro_export]` because it is crate-internal plumbing that has to live at
+/// the CRATE ROOT to be reachable as `$crate::...` from a discovered route module (a route file
+/// has no `use` statement at all - see `build_support/mod.rs` "Route file contract").
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __service_route_method_router {
+    // The verb-agnostic mount: no `MethodFilter`, no router-level 405, no `allow` header.
+    (ANY, $handler:path) => {
+        axum::routing::any($handler)
+    };
+    // Every real verb, exactly as before this helper existed.
+    ($method:ident, $handler:path) => {
+        axum::routing::on(axum::routing::MethodFilter::$method, $handler)
     };
 }
 
@@ -200,6 +260,55 @@ mod tests {
     /// be able to concatenate it).
     mod empty_probe {
         crate::service_routes! {}
+    }
+
+    /// The verb-agnostic form, written the way the `/v1/harness` bridge writes it (T6): three
+    /// `ANY` entries, a `{*rest}` pattern, a reused handler, and ONE real verb (`GET`) mixed in -
+    /// which is the shape that would break if `ANY` had to reuse `axum::routing::MethodFilter`.
+    mod any_probe {
+        crate::service_routes! {
+            ANY "/probe/any" => read_any, "Answers every verb on this path";
+            ANY "/probe/any/{*rest}" => read_any, "Answers every verb under this prefix";
+            GET "/probe/mixed" => read_any, "A declared verb beside the ANY mounts";
+        }
+
+        async fn read_any() {}
+    }
+
+    /// `ANY` is metadata `\"ANY\"` plus `axum::routing::any`, and it coexists with a `MethodFilter`
+    /// verb in the same entry list: both halves come from the same tokens, in the order written.
+    ///
+    /// That the router really answers an undeclared verb is proven over a socket, not here -
+    /// `tests/harness_gateway.rs` (a `DELETE` and an unregistered method on `/v1/harness/...`) and
+    /// `tests/server_http.rs` (the dispatch plan sends the literal `ANY`). This test pins the two
+    /// things only the macro can pin: the listing token and the fact that the emitted `register`
+    /// compiles and mounts every entry.
+    #[test]
+    fn the_any_verb_lists_the_literal_any_and_mounts_alongside_a_real_verb() {
+        assert_eq!(
+            any_probe::ENDPOINTS,
+            &[
+                EndpointMeta {
+                    method: "ANY",
+                    path: "/probe/any",
+                    summary: "Answers every verb on this path",
+                },
+                EndpointMeta {
+                    method: "ANY",
+                    path: "/probe/any/{*rest}",
+                    summary: "Answers every verb under this prefix",
+                },
+                EndpointMeta {
+                    method: "GET",
+                    path: "/probe/mixed",
+                    summary: "A declared verb beside the ANY mounts",
+                },
+            ]
+        );
+        // Building the table is where axum would reject a bad `MethodRouter` (a duplicate
+        // method+path pair panics here), so `has_routes()` on a mixed list is the router half.
+        let router = any_probe::register(axum::Router::<crate::server::AppState>::new());
+        assert!(router.has_routes());
     }
 
     /// An empty invocation must produce the identity `register` and an empty `ENDPOINTS`,

@@ -14,6 +14,13 @@
 //!   both stay in this file, because the router factory is the only thing that
 //!   knows which paths are reserved - the listing's *entries* are still generated,
 //!   never hand-maintained.
+//! * [`gateway`] is the transport's own layer, outside every route: the four
+//!   cross-origin headers the TS host publishes on every response
+//!   (`packages/underload/service/src/server/start.ts:415-444`) and the `204` answer
+//!   to a CORS preflight. It is a layer rather than a route because a policy that
+//!   every response must carry cannot be attached to some of them - and because a
+//!   preflight must be answered before the router is consulted, which is what a
+//!   route could not do for a path that is only reachable by a *different* verb.
 //!
 //! What deliberately does NOT live here: the listener, the CLI and shutdown
 //! (`src/bin/server.rs`), and any endpoint handler (they are discovered from
@@ -30,7 +37,11 @@ use std::path::{Component, Path, PathBuf};
 use axum::Json;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::extract::Request;
+use axum::http::Method;
 use axum::http::header;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
@@ -50,6 +61,18 @@ pub use metadata::EndpointMeta;
 /// 1 MiB is comfortably above every documented example body and below anything a
 /// caller would reasonably call a "payload"; raise it here (single place) when a
 /// real endpoint needs more, never per-route.
+///
+/// What this cap does NOT cover (T6): it is a [`DefaultBodyLimit`], and that layer
+/// only governs extractors that ask for it - `Json`/`Bytes`/`String`/`Form`
+/// (`axum-core-0.5.6/src/extract/default_body_limit.rs`, "if an extractor consumes
+/// the body directly with `Body::poll_frame`, or similar, the default limit is _not_
+/// applied"). The `/v1/harness` bridge takes `Request` and streams the body itself,
+/// so it is bounded by the harness's OWN per-route caps (1 MiB, and 16 MiB for
+/// `POST /v1/harness/sessions/{id}/tasks`, `src/api/mod.rs::body_limit_for`), exactly
+/// as it is on the standalone listener. Widening this constant would therefore change
+/// nothing for the harness while silently loosening every JSON endpoint, which is why
+/// the layer stays at 1 MiB and `tests/harness_gateway.rs` pins a > 1 MiB body on the
+/// harness route answering as a DOMAIN response (404), never as a framework 413.
 pub const MAX_REQUEST_BODY_BYTES: usize = 1 << 20;
 
 /// Shared state for every route. Cloneable by design: axum clones it per request
@@ -261,8 +284,116 @@ async fn route_metadata_listing() -> Response {
     (headers, Json(routes)).into_response()
 }
 
-/// The whole HTTP surface: generated routes + the shared body cap, frozen with
-/// `state`.
+// ---------------------------------------------------------------------------
+// The gateway half of every response (T6): the cross-origin header set the
+// `@underload/service` host publishes, plus the preflight answer in front of routing.
+//
+// TypeScript origin: `packages/underload/service/src/server/start.ts:415-444`, which wraps
+// every app (gateway AND worker) with exactly two middlewares:
+//
+//   * `app.use('*', ...)` registered BEFORE `cors()`, so - onion model - it writes its header
+//     AFTER the response exists (`start.ts:434-437`): `Access-Control-Allow-Private-Network:
+//     true` therefore lands on cors()'s own `204`, on the gateway's `307` redirect answers, on
+//     every endpoint response, and on the media responses that bypass Hono entirely
+//     (`src/server/media.ts:86-98` restates the same two values for its raw pipe).
+//   * `cors({ origin: '*', allowMethods: ['*'], allowHeaders: ['*'] })` (`start.ts:438`), which
+//     answers a CORS preflight with a header-only `204` and otherwise decorates the response.
+//
+// axum has no hono, so one `from_fn` layer reproduces both halves: `with_gateway_headers` is the
+// "after the handler" decoration and `gateway` is the preflight short-circuit. Chrome sends
+// `Access-Control-Request-Private-Network: true` on any preflight that targets a private/LAN
+// address (a public page fetching `http://192.168.50.109:5000`); without the allow header the
+// browser blocks the request before any endpoint runs, which is why the value is set
+// unconditionally rather than echoed - the same reasoning the TS comment gives, and the reason a
+// cross-origin playground on another device can talk to this server at all.
+//
+// What is deliberately NOT copied from TS: the `307` worker-redirect tier. That tier exists
+// because the TS gateway forks one worker process per endpoint group; this router serves
+// everything in-process, so there is nothing to redirect to and no second listener to keep in
+// sync (the bind defaults are unchanged by T6).
+//
+// Why the preflight test needs `Access-Control-Request-Method`: that header is what makes an
+// `OPTIONS` a *preflight* rather than an `OPTIONS` request. Hono's `cors()` short-circuits on the
+// pair (method AND the header), and the same condition here is what keeps a plain `OPTIONS`
+// routable: `OPTIONS /v1/services/pets` still reaches the router and still answers the router's
+// own 405 + `allow` (pinned by `tests/server_http.rs`), and a bare `OPTIONS /v1/harness` still
+// reaches the harness dispatcher, which answers its own contract sentence. Short-circuiting every
+// `OPTIONS` would have silently retired both behaviours, and every endpoint in this crate answers
+// `OPTIONS` only through a fallback - none declares it.
+//
+// Why a `101` upgrade survives this layer: only `Response::headers_mut()` is touched, and the
+// WebSocket handover is carried by the REQUEST's extensions (`hyper::upgrade::on` reads the
+// callback hyper attached there), which `Next::run` forwards untouched. Proven over a real socket
+// by `tests/harness_gateway.rs`.
+// ---------------------------------------------------------------------------
+
+/// `Access-Control-Allow-Private-Network` is not in the `http` crate's header table (it is a
+/// Chrome-specified response header that never became an RFC), so its name is spelled once here.
+/// `HeaderName::from_static` is a `const fn` (http-1.5.0 `src/header/name.rs:1234`), so the
+/// lowercase-normalised name is built at compile time and never re-parsed per request.
+const PRIVATE_NETWORK_ALLOW_HEADER: HeaderName =
+    HeaderName::from_static("access-control-allow-private-network");
+
+/// The value the three `Access-Control-Allow-*` headers carry: this host answers every origin,
+/// every verb and every header, exactly as the TS gateway does (`allowMethods: ['*']`,
+/// `allowHeaders: ['*']`).
+const GATEWAY_ALLOW_ALL: &str = "*";
+
+/// Adds the gateway's four cross-origin headers to `response`, replacing anything a handler set
+/// for them so the advertised policy is the transport's, not one endpoint can quietly narrow.
+#[must_use]
+fn with_gateway_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static(GATEWAY_ALLOW_ALL),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static(GATEWAY_ALLOW_ALL),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static(GATEWAY_ALLOW_ALL),
+    );
+    // The PNA answer is `true` (not an echo): a client that did not ask for it ignores the
+    // header, and a client that did must not have to re-negotiate after a redirect.
+    headers.insert(
+        PRIVATE_NETWORK_ALLOW_HEADER,
+        HeaderValue::from_static("true"),
+    );
+
+    response
+}
+
+/// A CORS preflight, i.e. an `OPTIONS` that declares the verb it wants to send next
+/// (`Access-Control-Request-Method`). Hono's `cors()` gates its `204` on the same pair, which is
+/// what keeps a plain `OPTIONS` a normal routable request - see the block comment above.
+#[must_use]
+fn is_cors_preflight(request: &Request) -> bool {
+    request.method() == Method::OPTIONS
+        && request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+}
+
+/// The outermost layer of [`app`]: a preflight `204` before routing, otherwise the routed
+/// response with [`with_gateway_headers`] applied to it.
+///
+/// `Next`'s default body/state parameters are the right ones here precisely because this layer
+/// sits AFTER `.with_state`, so it never has to name `AppState` (the harness route files do).
+async fn gateway(request: Request, next: Next) -> Response {
+    if is_cors_preflight(&request) {
+        // Body-less by definition (`204` means "no body", and the CORS answer is the whole
+        // response), so no media type is claimed and no body is drained.
+        return with_gateway_headers(StatusCode::NO_CONTENT.into_response());
+    }
+
+    with_gateway_headers(next.run(request).await)
+}
+
+/// The whole HTTP surface: generated routes + the shared body cap + the gateway header and
+/// preflight layer, frozen with `state`.
 ///
 /// `crate::register_routes` is emitted by `build.rs` into
 /// `$OUT_DIR/service_routes.rs` and included at crate scope by `src/lib.rs`; each
@@ -271,9 +402,11 @@ async fn route_metadata_listing() -> Response {
 ///
 /// Layer order is load-bearing: `.layer` only affects routes registered *before*
 /// it, so the body limit is applied after `register_routes` (covering every
-/// generated route) and `.with_state` comes last to erase `AppState` from the router
-/// type, which is what lets `app()` return the plain `axum::Router` the bin and the
-/// tests both serve.
+/// generated route) and `.with_state` comes last of the state-bearing chain to
+/// erase `AppState` from the router type, which is what lets `app()` return the
+/// plain `axum::Router` the bin and the tests both serve. The gateway layer rides
+/// on the OUTSIDE of all of it, so no route - generated, builtin or a future
+/// fallback - can escape the cross-origin header set.
 ///
 /// The builtin browser surface is registered in the same position on purpose: the
 /// four routes above are added before `.layer(DefaultBodyLimit::max(..))`, so the
@@ -297,11 +430,18 @@ pub fn app(state: AppState) -> Router {
         .route(PLAYGROUND_SCRIPT_PATH, get(playground_script))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
+        // Outermost, so a preflight is answered before the router is consulted AND
+        // every response - including a `101` upgrade and a bare 404 - carries the
+        // same four headers.
+        .layer(middleware::from_fn(gateway))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the gateway tests below need these two (`app()` itself never names a body type).
+    use axum::body::Body;
+    use axum::http::HeaderMap;
 
     /// The normaliser is the part of the default that can silently go wrong (a wrong
     /// number of `..` lands the data root inside the repo, which is the exact failure
@@ -379,5 +519,81 @@ mod tests {
             AppState::new(Path::new("/b")).database_root,
             PathBuf::from("/b")
         );
+    }
+
+    /// The preflight test is what separates a browser handshake from an ordinary `OPTIONS`
+    /// request, so BOTH halves are pinned: the verb alone must not short-circuit the router
+    /// (that would retire the documented 405 + `allow` answers), and the header alone must not
+    /// either (a `GET` may carry `Access-Control-Request-Method` for any reason).
+    #[test]
+    fn only_an_options_request_that_declares_its_method_is_a_preflight() {
+        // A real Chrome PNA preflight: OPTIONS + the verb it wants + the private-network ask.
+        let preflight = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/v1/harness")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header("access-control-request-private-network", "true")
+            .body(Body::empty())
+            .expect("a request the builder can represent");
+        assert!(is_cors_preflight(&preflight));
+
+        // The same verb with no declared method is a plain request: it must be routed.
+        let bare = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/v1/harness")
+            .body(Body::empty())
+            .expect("a request the builder can represent");
+        assert!(!is_cors_preflight(&bare));
+
+        // The same header on another verb is not a handshake either.
+        let with_header = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/harness")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .expect("a request the builder can represent");
+        assert!(!is_cors_preflight(&with_header));
+    }
+
+    /// The published policy, byte for byte, and the two things the decorator must not do: change
+    /// the status it is handed, or leave an endpoint's narrower `Access-Control-Allow-Origin`
+    /// standing under the gateway's (`insert`, not `entry`, is what makes the transport win).
+    #[test]
+    fn the_gateway_layer_publishes_the_cross_origin_headers_it_promises() {
+        let mut authored = HeaderMap::new();
+        authored.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("http://example.invalid"),
+        );
+        let response = with_gateway_headers((authored, "a body").into_response());
+        let headers = response.headers();
+
+        for name in [
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+        ] {
+            assert_eq!(
+                headers.get(&name).and_then(|value| value.to_str().ok()),
+                Some(GATEWAY_ALLOW_ALL),
+                "{name} must be the wildcard the TS host publishes"
+            );
+        }
+        assert_eq!(
+            headers
+                .get(PRIVATE_NETWORK_ALLOW_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        // Exactly one copy of each, whatever the handler already sent.
+        assert_eq!(
+            headers
+                .get_all(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .iter()
+                .count(),
+            1,
+            "a duplicated CORS header is a browser-level rejection"
+        );
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
