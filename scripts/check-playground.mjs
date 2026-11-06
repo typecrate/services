@@ -77,13 +77,23 @@ const { JSDOM, VirtualConsole } = jsdomModule;
 
 // ------------------------------------------------------------------------ fixtures
 
-/// The fifteen endpoints this package compiles in, exactly as `GET /v1/services/routes`
+/// The eighteen endpoints the compiled server lists, exactly as `GET /v1/services/routes`
 /// serialises them (`EndpointMeta` field order is JSON key order, `src/server/metadata.rs`).
-/// Registration order is the scanner's byte-wise order of the route files, so
-/// `POST /v1/services/echo` leads and the two REST sample trees come last, `locations`
-/// before `pets`; inside a route file the order is the `crate::service_routes!` entry order.
+///
+/// The three `/v1/harness` rows come FIRST: the bridge's route file lives in the harness
+/// package (`packages/typecrate/harness/endpoint/harness/harness-route.rs`), and a scan rooted
+/// at the repository default sorts `packages/typecrate/h…` before `packages/typecrate/s…`
+/// (R2, pinned by `tests/discovery.rs::the_harness_bridge_in_another_package_is_discovered_and_registered`
+/// and by `tests/server_http.rs::route_table`). `ANY` is the listing token of a verb-agnostic
+/// mount, not a wire verb. The rest is the scanner's byte-wise order of this package's route
+/// files, so `POST /v1/services/echo` leads and the two REST sample trees come last,
+/// `locations` before `pets`; inside a route file the order is the `crate::service_routes!`
+/// entry order.
 const LISTING_JSON =
-    '[{"method":"POST","path":"/v1/services/echo","summary":"Echoes the posted `value` unchanged"},' +
+    '[{"method":"ANY","path":"/v1/harness","summary":"Underload harness service document"},' +
+    '{"method":"ANY","path":"/v1/harness/stream","summary":"Underload harness realtime stream (harness.v1 WebSocket)"},' +
+    '{"method":"ANY","path":"/v1/harness/{*rest}","summary":"Underload harness API resources"},' +
+    '{"method":"POST","path":"/v1/services/echo","summary":"Echoes the posted `value` unchanged"},' +
     '{"method":"GET","path":"/v1/services/echo/{value}","summary":"Echoes `{value}`, with `?prefix=` applied"},' +
     '{"method":"GET","path":"/v1/services/health","summary":"Reports the service name and version"},' +
     '{"method":"GET","path":"/v1/services/locations","summary":"Lists every stored location, `?city=` narrows by exact city"},' +
@@ -366,7 +376,7 @@ const LABEL_422 = await statusLabel(422, 'POST', '/v1/services/echo', {
 const LABEL_415 = await statusLabel(415, 'POST', '/v1/services/echo', { headers: {} });
 
 // --- 1. the listing drives the rail: rows, order, count, and one automatic request --
-await waitFor('endpoint list', () => doc.querySelectorAll('#endpoint-list button').length === 15);
+await waitFor('endpoint list', () => doc.querySelectorAll('#endpoint-list button').length === 18);
 check(
     'endpoint rows',
     [...doc.querySelectorAll('#endpoint-list button')]
@@ -379,6 +389,9 @@ check(
         )
         .join('\n'),
     [
+        'ANY|/v1/harness|Underload harness service document',
+        'ANY|/v1/harness/stream|Underload harness realtime stream (harness.v1 WebSocket)',
+        'ANY|/v1/harness/{*rest}|Underload harness API resources',
         'POST|/v1/services/echo|Echoes the posted `value` unchanged',
         'GET|/v1/services/echo/{value}|Echoes `{value}`, with `?prefix=` applied',
         'GET|/v1/services/health|Reports the service name and version',
@@ -396,9 +409,9 @@ check(
         'DELETE|/v1/services/pets/{id}|Removes one pet by id and answers 204, or 404 when the id is unknown',
     ].join('\n'),
 );
-check('endpoint count', text('endpoint-count'), '15 endpoints');
+check('endpoint count', text('endpoint-count'), '18 endpoints');
 check('endpoint rail state is quiet', text('endpoint-state'), '');
-check('the method becomes a data attribute, never a style', doc.querySelector('#endpoint-list .badge').getAttribute('data-method'), 'post');
+check('the method becomes a data attribute, never a style', doc.querySelector('#endpoint-list .badge').getAttribute('data-method'), 'any');
 check('listing request url', requests[0].url, '/v1/services/routes');
 check('listing request method', requests[0].method, 'GET');
 check(
@@ -410,11 +423,15 @@ check('the listing is the only automatic request', requests.length, 1);
 check('nothing has been answered yet', text('fact-url'), '');
 
 // --- 2. the first entry is pre-loaded, so the tool works without a click -----------
-check('auto-selected entry', text('composer-target'), 'POST /v1/services/echo');
-check('auto-selected method', value('request-method'), 'POST');
-check('auto-selected path', value('request-path'), '/v1/services/echo');
-check('auto-selected starter body', value('request-body'), '{\n  "value": "hello from the playground"\n}');
-check('auto-selected row is marked', rowFor('Use POST /v1/services/echo - Echoes the posted `value` unchanged').getAttribute('aria-current'), 'true');
+// The first row is the `/v1/harness` bridge, because the harness route file lives in the harness
+// package and a repository-root scan sorts it first (T6/R2) - the playground pre-loads whatever
+// the listing puts first, so the expectations follow the listing, not the sample endpoints.
+check('auto-selected entry', text('composer-target'), 'ANY /v1/harness');
+check('auto-selected method', value('request-method'), 'ANY');
+check('auto-selected path', value('request-path'), '/v1/harness');
+// `ANY` is a verb-agnostic mount: it is not POST/PUT/PATCH, so the body editor stays hidden.
+check('auto-selected starter body', value('request-body'), '');
+check('auto-selected row is marked', rowFor('Use ANY /v1/harness - Underload harness service document').getAttribute('aria-current'), 'true');
 
 // --- 3. selection rebuilds the composer: required path params, no body editor ------
 rowFor('Use GET /v1/services/echo/{value} - Echoes `{value}`, with `?prefix=` applied').click();
@@ -497,7 +514,7 @@ check('the previous response is kept while input is invalid', text('response-bod
 element('endpoint-search').value = 'health';
 element('endpoint-search').dispatchEvent(new window.Event('input', { bubbles: true }));
 await waitFor('filtered rail', () => doc.querySelectorAll('#endpoint-list button').length === 1);
-check('filtered count', text('endpoint-count'), '1 match of 15');
+check('filtered count', text('endpoint-count'), '1 match of 18');
 check('a filter that matches leaves the state line empty', text('endpoint-state'), '');
 check('the composer keeps its selection', text('composer-target'), 'GET /v1/services/echo/{value}');
 element('endpoint-search').value = 'nope';
@@ -506,7 +523,7 @@ await waitFor('empty rail', () => doc.querySelectorAll('#endpoint-list button').
 check('no-match state', text('endpoint-state'), 'No endpoint matches "nope".');
 element('endpoint-search').value = '';
 element('endpoint-search').dispatchEvent(new window.Event('input', { bubbles: true }));
-await waitFor('full rail', () => doc.querySelectorAll('#endpoint-list button').length === 15);
+await waitFor('full rail', () => doc.querySelectorAll('#endpoint-list button').length === 18);
 
 // --- 8. POST: the editor, the automatic content-type, the real round trip --------
 const postRow = rowFor('Use POST /v1/services/echo - Echoes the posted `value` unchanged');
@@ -740,14 +757,14 @@ brokenDoc.getElementById('endpoint-search').dispatchEvent(new brokenDom.window.E
 // (the collapsed one here) is re-derived from the listing that now answers.
 const retried = instrument(brokenDom.window);
 brokenDoc.getElementById('reload-endpoints').click();
-await waitFor('the retried rail', () => brokenDoc.querySelectorAll('#endpoint-list button').length === 15);
+await waitFor('the retried rail', () => brokenDoc.querySelectorAll('#endpoint-list button').length === 18);
 check('the retry issued only the listing request', retried.length, 1);
 check('the retry requested the listing', retried[0].url, '/v1/services/routes');
 check('the retry cleared the error line', brokenText('endpoint-state'), '');
 check('the retry hid itself', brokenDoc.getElementById('reload-endpoints').hidden, true);
-check('the retry reported the count', brokenText('endpoint-count'), '15 endpoints');
+check('the retry reported the count', brokenText('endpoint-count'), '18 endpoints');
 check('the retry enabled the composer', brokenDoc.getElementById('send').disabled, false);
-check('the retry pre-loaded the first entry', brokenText('composer-target'), 'POST /v1/services/echo');
+check('the retry pre-loaded the first entry', brokenText('composer-target'), 'ANY /v1/harness');
 brokenDom.window.close();
 
 // --- 18. the page's own safety rules -------------------------------------------

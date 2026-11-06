@@ -586,10 +586,23 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             println!("{line}");
         }
 
-        // Graceful shutdown: `serve` stops accepting and lets in-flight requests
-        // finish, matching the SIGINT/SIGTERM behaviour of the TS entry.
+        // Graceful shutdown, in the order the standalone entry performs it.
+        //
+        // `shutdown_signal()` resolves on Ctrl+C/SIGTERM. The harness half runs FIRST,
+        // before axum stops accepting, because it is what makes the drain FINISH:
+        // `begin_shutdown_all` (`typecrate_harness::server:129-134`) marks every cached
+        // root's store `shuttingDown` - no further turn is claimed - and closes every live
+        // event stream with 1001. Without it this listener owns the streams (the harness
+        // route is mounted here, not on a standalone harness listener), an open SSE or
+        // WebSocket response never completes, and `serve`'s graceful drain would wait on
+        // clients that are only waiting on US. It is a no-op when this process serves no
+        // harness root (the remote-hosts mode), so one path is correct for both.
         match axum::serve(listener, app(state))
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async {
+                shutdown_signal().await;
+
+                typecrate_harness::server::begin_shutdown_all();
+            })
             .await
         {
             Ok(()) => {

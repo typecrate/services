@@ -583,8 +583,10 @@ async fn health_the_empty_page_a_created_session_and_the_catalogue_reads_answer_
         "the durable document is below the root the state carries"
     );
 
-    // The tool catalogue: the shipped registry's 35 rows (`tools/catalogue.rs`), and the
-    // contract's own `timeNow` among them. The DEFAULT page is 25 of those 35
+    // The tool catalogue: the shipped registry's 31 LISTED rows - 35 rows exist in
+    // `tools/catalogue.rs`, and the four the manifest marks `listed: false`
+    // (`catalogue::UNLISTED`) are withheld from the server listing, so they must not appear here.
+    // The contract's own `timeNow` is among the 31. The DEFAULT page is 25 of those 31
     // (`contract::PAGE_LIMIT_DEFAULT`), which is why this read asks for the maximum page - a
     // gateway bug that dropped the query string would show up here as 25 rows and a cursor.
     let tools = Reply::send(http.get(server.url("/v1/harness/tools?limit=100"))).await;
@@ -597,12 +599,12 @@ async fn health_the_empty_page_a_created_session_and_the_catalogue_reads_answer_
         .collect();
     assert_eq!(
         names.len(),
-        35,
-        "the whole shipped catalogue is reachable through the gateway"
+        31,
+        "the whole LISTED shipped catalogue is reachable through the gateway"
     );
     assert_eq!(
         tools.body["limit"],
-        json!(35),
+        json!(31),
         "`limit` echoes the EFFECTIVE size"
     );
     assert_eq!(
@@ -614,6 +616,14 @@ async fn health_the_empty_page_a_created_session_and_the_catalogue_reads_answer_
         names.contains(&"timeNow"),
         "`timeNow` is a shipped tool and must be reachable through the gateway: {names:?}"
     );
+    // The listing rule (`catalogue::is_listed`): these four exist in the registry for the session
+    // toolbox and the execution dispatch, but the server never advertises them.
+    for withheld in ["toolCancel", "threadSend", "threadRead", "threadList"] {
+        assert!(
+            !names.contains(&withheld),
+            "`{withheld}` is `listed: false` and must not be advertised by /tools: {names:?}"
+        );
+    }
 
     // The config read: the key-free defaults document, on its untouched revision 0.
     let config = Reply::send(http.get(server.url("/v1/harness/config"))).await;
