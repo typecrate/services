@@ -634,7 +634,15 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
                 Ok(mut signal) => signal.recv().await,
                 Err(err) => {
                     eprintln!("typecrate-services-server: SIGTERM unavailable ({err})");
-                    std::future::pending::<()>().await;
+                    // Both match arms have to yield the same type, and the `Ok` arm yields
+                    // `Option<()>`: `Signal::recv()` returns `Some(())` per delivered signal
+                    // and `None` once the sender is dropped. `pending::<Option<()>>()` is that
+                    // exact item type on an infinite wait, so this arm keeps doing what it
+                    // always did - log why the backend is missing, then park forever, which
+                    // leaves the `select!` below waiting on Ctrl+C alone. The old
+                    // `pending::<()>` yielded `()` and was the E0308 mismatch; `None` vs
+                    // `Some(())` is never inspected, so no control flow changes either way.
+                    std::future::pending::<Option<()>>().await
                 }
             }
         };
@@ -645,7 +653,10 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
 
         tokio::select! {
             () = ctrl_c => {}
-            () = terminate => {}
+            // `_` instead of `()`: on unix this future resolves to the `Option<()>` item of the
+            // match above, on non-unix to `()` from the bare `pending::<()>`. The payload is
+            // meaningless for a terminate signal - reaching this arm at all is the whole answer.
+            _ = terminate => {}
         }
         eprintln!("typecrate-services-server: shutdown signal received, draining");
     }

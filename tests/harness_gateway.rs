@@ -583,10 +583,15 @@ async fn health_the_empty_page_a_created_session_and_the_catalogue_reads_answer_
         "the durable document is below the root the state carries"
     );
 
-    // The tool catalogue: the shipped registry's 31 LISTED rows - 35 rows exist in
-    // `tools/catalogue.rs`, and the four the manifest marks `listed: false`
-    // (`catalogue::UNLISTED`) are withheld from the server listing, so they must not appear here.
-    // The contract's own `timeNow` is among the 31. The DEFAULT page is 25 of those 31
+    // The tool catalogue: the shipped registry's 32 LISTED rows - 36 rows exist in
+    // `tools/catalogue.rs` (`catalogue::ENTRIES: [Entry; 36]`), and the four the manifest marks
+    // `listed: false` (`catalogue::UNLISTED`) are withheld from the server listing, so they must
+    // not appear here. The figure is the one the harness crate pins for its OWN listener
+    // (`../harness/tests/http_host.rs:1850-1855`, "36 generated rows minus the four `listed:
+    // false`"), because this gateway serves that crate's catalogue rather than a copy of it - so a
+    // catalogue row added or renamed on the harness side moves this number too (harness `c25647c`
+    // added the listed `records` row on top of the previous 35, which is what took 31 to 32).
+    // The contract's own `timeNow` is among the 32. The DEFAULT page is 25 of those 32
     // (`contract::PAGE_LIMIT_DEFAULT`), which is why this read asks for the maximum page - a
     // gateway bug that dropped the query string would show up here as 25 rows and a cursor.
     let tools = Reply::send(http.get(server.url("/v1/harness/tools?limit=100"))).await;
@@ -599,12 +604,12 @@ async fn health_the_empty_page_a_created_session_and_the_catalogue_reads_answer_
         .collect();
     assert_eq!(
         names.len(),
-        31,
+        32,
         "the whole LISTED shipped catalogue is reachable through the gateway"
     );
     assert_eq!(
         tools.body["limit"],
-        json!(31),
+        json!(32),
         "`limit` echoes the EFFECTIVE size"
     );
     assert_eq!(

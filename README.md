@@ -37,10 +37,10 @@ packages/typecrate/services/
   tests/api.rs              # native-consumption test (links the rlib like a downstream crate)
   tests/discovery.rs        # scanner/generator rules against real fixture trees
   tests/server_http.rs      # real-TCP HTTP tests of the exact library router
-  scripts/build-wasm.mjs    # wasm artifact -> pkg/ glue + generated .d.ts
-  scripts/discover-services.mjs # pre-step: tree-shape snapshot -> Temp/ watched file
-  scripts/check-playground.mjs  # optional jsdom check of the embedded browser surface
-  examples/node-smoke.mjs   # runs pkg/ glue in Node and asserts exact values
+  scripts/build-wasm.ts    # wasm artifact -> pkg/ glue + generated .d.ts
+  scripts/discover-services.ts # pre-step: tree-shape snapshot -> Temp/ watched file
+  scripts/check-playground.ts  # optional jsdom check of the embedded browser surface
+  examples/node-smoke.ts   # runs pkg/ glue in Node and asserts exact values
   pkg/                      # generated (git-ignored): JS + .d.ts + .wasm
 ```
 
@@ -247,7 +247,7 @@ The order is the scanner's byte-wise order of the route files, so
 `endpoints/echo/echo-route.rs`, `health-route.rs`, `locations-route.rs` and `pets-route.rs` — the
 `*-core.rs` files sitting next to them are never scanned, so they cannot change this order; inside
 one route file it is the order of the `crate::service_routes!` entries. And the set is not only
-prose: `scripts/check-playground.mjs` pins it row-by-row in rail order (`LISTING_JSON`), so
+prose: `scripts/check-playground.ts` pins it row-by-row in rail order (`LISTING_JSON`), so
 `npm run check:ui -- --base <origin>` fails the moment a running server lists a different
 method, path or summary.
 
@@ -562,7 +562,7 @@ Because the harness tree is a **brand-new `endpoint` folder** outside every prev
 tree, adding it needed one explicit re-scan: `npm run discover` (the snapshot step every npm script
 already runs), or by hand `TYPECRATE_SERVICES_RESCAN=<anything> cargo build`. See
 [Rebuild tracking](#rebuild-tracking-what-re-runs-the-scan-and-what-needs-a-re-scan).
-`scripts/check-playground.mjs` pins the playground rail row by row (`LISTING_JSON`), so it has to
+`scripts/check-playground.ts` pins the playground rail row by row (`LISTING_JSON`), so it has to
 carry these three rows too; that script is not part of the Rust gate.
 
 ### Gateway headers, preflights and body limits
@@ -740,7 +740,7 @@ file is a compile error on the route file, never a silent removal). Two ways to 
 the explicit re-scan, neither of them a `cargo clean` and neither a daemon:
 
 - **npm scripts (automatic):** `build`, `start`, `run-native`, `check` and `test` all
-  start with `node scripts/discover-services.mjs` (`npm run discover` on its own) -
+  start with `vite-node scripts/discover-services.ts` (`npm run discover` on its own) -
   no dependencies, ~50 ms. It walks the tree with the scanner's prune rules and
   rewrites one file, `<repo>/Temp/typecrate-services/route-discovery.json`, which
   `build.rs` watches as an individual path. Its revision hashes **paths only**, so an
@@ -871,18 +871,18 @@ for `wasm32-unknown-unknown`.
 
 | Script | Command | Gate |
 | --- | --- | --- |
-| `discover` | `node scripts/discover-services.mjs` | native: rewrites the watched discovery snapshot (`--force`, `--print`) || `build` | `node scripts/discover-services.mjs && cargo build --release --locked` | native: rlib + cdylib + the server executable |
-| `start`, `run-native` | `node scripts/discover-services.mjs && cargo run --bin typecrate-services-server --locked --` | native: forwards everything after `npm … --` |
-| `check` | `node scripts/discover-services.mjs && cargo check --workspace --all-targets --locked` | native |
-| `check:ui` | `node scripts/check-playground.mjs` | **optional**, JS: drives the embedded page in jsdom (the workspace root's copy; `--base <origin>` runs the same suite against a live server). Not part of `verify`, which stays JS-free |
-| `test` | `node scripts/discover-services.mjs && cargo test --workspace --locked` | native: unit + discovery + real-socket HTTP |
+| `discover` | `vite-node scripts/discover-services.ts` | native: rewrites the watched discovery snapshot (`--force`, `--print`) || `build` | `vite-node scripts/discover-services.ts && cargo build --release --locked` | native: rlib + cdylib + the server executable |
+| `start`, `run-native` | `vite-node scripts/discover-services.ts && cargo run --bin typecrate-services-server --locked --` | native: forwards everything after `npm … --` |
+| `check` | `vite-node scripts/discover-services.ts && cargo check --workspace --all-targets --locked` | native |
+| `check:ui` | `vite-node scripts/check-playground.ts` | **optional**, JS: drives the embedded page in jsdom (the workspace root's copy; `--base <origin>` runs the same suite against a live server). Not part of `verify`, which stays JS-free |
+| `test` | `vite-node scripts/discover-services.ts && cargo test --workspace --locked` | native: unit + discovery + real-socket HTTP |
 | `lint` | `cargo clippy --workspace --all-targets --locked` | what root `turbo run test` executes; must not deny warnings |
 | `lint:strict` | the same with `-D warnings` | CI/verify gate (it lints the generated module too) |
 | `fmt`, `fmt:check` | `cargo fmt --all [-- --check]` | native |
 | `verify` | `fmt:check` + `lint:strict` + `test` + `build` | **native gate** |
 | `wasm:check` | `cargo check --target wasm32-unknown-unknown --all-targets --locked` | WASM cross-compile |
-| `build:wasm` | `node scripts/build-wasm.mjs` | WASM: artifact + glue + declarations |
-| `smoke:wasm` | `node examples/node-smoke.mjs` | WASM: runs `pkg/` in Node, exact values |
+| `build:wasm` | `vite-node scripts/build-wasm.ts` | WASM: artifact + glue + declarations |
+| `smoke:wasm` | `vite-node examples/node-smoke.ts` | WASM: runs `pkg/` in Node, exact values |
 | `verify:wasm` | `wasm:check` + `build:wasm` + `smoke:wasm` | **WASM chain**, secondary |
 | `prepack` | `npm run build:wasm` | `npm pack`/`publish` cannot ship dead entry paths |
 
@@ -917,7 +917,7 @@ Prerequisites — the pipeline builds nothing by itself and installs nothing:
 
    or unpack the matching prebuilt release into `.rust/bin` (`rust/README.md`'s
    local tool home). An arbitrary location works too: set
-   `TYPECRATE_WASM_BINDGEN=/path/to/wasm-bindgen`. `scripts/build-wasm.mjs` reads
+   `TYPECRATE_WASM_BINDGEN=/path/to/wasm-bindgen`. `scripts/build-wasm.ts` reads
    the pin out of `Cargo.lock` and refuses a CLI whose version differs, instead of
    letting the generated loader panic later.
 
@@ -943,7 +943,7 @@ The generated entry's **default export is the init function** (`__wbg_init` in t
 a `URL`, a `Request`, a `Response`/`WebAssembly.Module`/bytes, or a
 `{ module_or_path }` object — passing the value directly instead of in an object
 prints `using deprecated parameters for the initialization function` (the shipped
-`examples/node-smoke.mjs` still does that, so `smoke:wasm` prints the notice; the
+`examples/node-smoke.ts` still does that, so `smoke:wasm` prints the notice; the
 object form is the one to copy).
 
 `--target web` is deliberate (see `rust/README.md` "One artifact, both runtimes"):
@@ -971,7 +971,7 @@ module URL cannot resolve (own CDN path, prefetched `Response`,
 ### Node
 
 Node's `fetch` cannot read `file:` URLs, so pass the bytes
-(`examples/node-smoke.mjs` is the runnable version of this):
+(`examples/node-smoke.ts` is the runnable version of this):
 
 ```js
 import { readFileSync } from "node:fs";
@@ -1051,7 +1051,7 @@ above. Neither affects the native milestone.
 ## Notes
 
 - `Cargo.lock` belongs to this standalone workspace and is committed; the root
-  workspace keeps its own. Every cargo script and `scripts/build-wasm.mjs` pass
+  workspace keeps its own. Every cargo script and `scripts/build-wasm.ts` pass
   `--locked`, so the graph (and the `wasm-bindgen` version the CLI must match) only
   changes when someone runs `cargo generate-lockfile` on purpose.
 - Turbo (root `turbo.json`) caches `build` outputs as `dist/**`; this package's
