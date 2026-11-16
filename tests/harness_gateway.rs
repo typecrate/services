@@ -31,10 +31,6 @@
 //! silently share sessions, revisions and the epoch, and an assertion about a FRESH store (`limit:
 //! 0`, `revision: 0`) would depend on test order. The `<pid>` prefix additionally separates
 //! concurrent `cargo test` processes.
-//!
-//! Compiled only for non-wasm targets, like every other HTTP test in this package: the harness
-//! dependency and the server module are both behind the inverse-wasm gate in `Cargo.toml`.
-#![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 
 use std::fs;
 use std::path::Path;

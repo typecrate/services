@@ -47,8 +47,6 @@
 //!   serialised listing can never leak the absolute scan root or a `#[path]` value the way
 //!   the generated file's *comments* do. This is the same rule `src/server/mod.rs` states
 //!   for `AppState::database_root`: paths stay process-local.
-//! * **No wasm.** This module lives under `pub mod server`, which `src/lib.rs` compiles only
-//!   for non-wasm targets, so `serde` still does not reach the wasm artifact (R4).
 //!
 //! # Wiring (who names what)
 //!

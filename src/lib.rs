@@ -1,22 +1,16 @@
 //! `typecrate_services` - Rust-native core behind the `@typecrate/services` npm package.
 //!
-//! Two consumers, ONE implementation (see `Cargo.toml` for why this is a
-//! standalone workspace sitting in the npm package directory):
+//! Native-only: host builds link this rlib crate-to-crate, and the package's own
+//! executable links it to serve HTTP - no wasm, no serialisation, no JavaScript in
+//! the loop. There is one consumer and one path (see `Cargo.toml` for why this is a
+//! standalone workspace sitting in the npm package directory).
 //!
-//! * native (default): host builds link this rlib crate-to-crate - no wasm, no
-//!   serialisation, no JavaScript in the loop. This is the primary path, and since
-//!   T10 it also includes the native HTTP runtime (`server`, plus the
-//!   `typecrate-services-server` executable in `src/bin/server.rs`).
-//! * JS boundary (optional): `cargo build --target wasm32-unknown-unknown` plus
-//!   `wasm-bindgen --target web` (driven by `scripts/build-wasm.mjs`) publish the
-//!   same functions to Node/browser as `pkg/typecrate_services.js` + the
-//!   generated `pkg/typecrate_services.d.ts`.
+//! The crate includes the native HTTP runtime: `server` (shared state + the axum
+//! `Router` factory) and the `typecrate-services-server` executable in
+//! `src/bin/server.rs`.
 //!
-//! CURRENT STATE: identity-level core (`CRATE_NAME`, `version`, `echo`) - the API
-//! the TS service and the wasm glue already expose - plus the native server
-//! runtime below. `echo` and the wasm surface are unchanged; the runtime is
-//! additive and compiled only for non-wasm targets, so `npm run wasm:check` and
-//! `npm run build:wasm` keep compiling the same wasm module as before.
+//! CURRENT STATE: identity-level core (`CRATE_NAME`, `version`, `echo`) plus the
+//! native server runtime below.
 
 /// Crate name as Rust code refers to it (`-` becomes `_`, rust/README.md naming rule).
 pub const CRATE_NAME: &str = "typecrate_services";
@@ -31,19 +25,15 @@ pub fn version() -> &'static str {
 /// Identity helper: returns its input unchanged.
 ///
 /// It exists because it is the smallest function that exercises a real argument
-/// and a real return value across every boundary this package has (Rust caller,
-/// wasm caller). Any behaviour other than "the same bytes came back" is a bug in
-/// the boundary, not in this function.
+/// and a real return value across the public API. Any behaviour other than "the
+/// same bytes came back" is a bug, not in this function.
 #[must_use]
 pub fn echo(text: &str) -> String {
     text.to_owned()
 }
 
 // ---------------------------------------------------------------------------
-// Native HTTP runtime: the whole block below is compiled only when the target is
-// NOT wasm32-unknown-unknown, which is the exact inverse of the wasm-bindgen gate
-// in Cargo.toml. axum/tokio are target-gated the same way, so a wasm build sees
-// neither the module nor its dependencies (tokio has no IO/time driver there).
+// Native HTTP runtime.
 //
 // ORDER MATTERS (integration contract with build.rs, owned by T11):
 //   * build.rs writes `service_routes.rs` into OUT_DIR; the generator emits
@@ -61,47 +51,10 @@ pub fn echo(text: &str) -> String {
 // Name resolution inside a crate is order-independent, so the include sitting
 // above `pub mod server` is a readability choice, not a requirement.
 // ---------------------------------------------------------------------------
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 include!(concat!(env!("OUT_DIR"), "/service_routes.rs"));
 
 /// Shared state + the axum `Router` factory for the native runtime.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod server;
-
-// ---------------------------------------------------------------------------
-// wasm boundary: compiled ONLY for wasm32-unknown-unknown, so a native build
-// never pulls wasm-bindgen in (the dependency is target-gated in Cargo.toml).
-// These are thin `String`/`&str` adapters over the native functions above; the
-// `js_name` spellings are the camelCase JS surface, and they are what
-// `scripts/build-wasm.mjs` and `examples/node-smoke.mjs` expect to find in the
-// generated glue.
-// ---------------------------------------------------------------------------
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-mod wasm {
-    use wasm_bindgen::prelude::*;
-
-    /// Rust-side crate identifier, for hosts that want to log which module they loaded.
-    #[wasm_bindgen(js_name = crateName)]
-    #[must_use]
-    pub fn crate_name() -> String {
-        super::CRATE_NAME.to_owned()
-    }
-
-    /// Crate version == the published npm version.
-    #[wasm_bindgen(js_name = version)]
-    #[must_use]
-    pub fn version() -> String {
-        super::version().to_owned()
-    }
-
-    /// `echo` across the JS boundary: proves the generated glue marshals strings
-    /// (including non-ASCII) without a second implementation.
-    #[wasm_bindgen(js_name = echo)]
-    #[must_use]
-    pub fn echo(text: &str) -> String {
-        super::echo(text)
-    }
-}
 
 #[cfg(test)]
 mod tests {

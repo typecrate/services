@@ -1838,7 +1838,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "typecrate-harness",
- "wasm-bindgen",
 ]
 
 [[package]]

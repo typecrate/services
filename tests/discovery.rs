@@ -10,9 +10,8 @@
 //!
 //! Not covered here (needs a cargo build, deferred to the integration pass): that the
 //! generated module compiles inside the crate root, that `crate::route_metadata()` really
-//! returns the example endpoints, and that none of this reaches the wasm32 artifact - all
-//! three are compile-time properties of `src/` (T10/T18), asserted by
-//! `npm run wasm:check` / `lint:strict` and by the HTTP tests. The same is true of the T14
+//! returns the example endpoints - both compile-time properties of `src/` (T10/T18),
+//! asserted by `lint:strict` and by the HTTP tests. The same is true of the T14
 //! rules: this file pins the *watch set* and the generated `#[allow(non_snake_case)]`
 //! attribute exactly, while "cargo re-runs the scan for those paths" and "those identifiers
 //! pass `-D warnings`" are properties of cargo and rustc (verified with an isolated `Temp/`
@@ -26,10 +25,6 @@
 //! a route file, so those values come from each file's `crate::service_routes!` invocation
 //! (`src/server/metadata.rs`), where one token feeds both the mount and the listing -
 //! a compile-time property checked by that macro's own unit tests, not by a filesystem walk.
-
-// `build_support` pulls in the `ignore` crate for its walk; that dependency is host-only
-// (see `Cargo.toml`), so this whole file is compiled out for the wasm target.
-#![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 
 #[path = "../build_support/mod.rs"]
 mod build_support;
@@ -1741,7 +1736,7 @@ fn the_discovery_snapshot_is_the_repo_scratch_file_the_npm_pre_step_writes() {
     );
     // AGENTS.md: scratch lives in the repository-root `Temp/`, never in OS temp.
     assert!(snapshot.starts_with(repo.join("Temp")));
-    // Not inside the package, which is where generated output (`pkg/`, `.rust/`) piles up,
+    // Not inside the package, which is where generated output (`.rust/`) piles up,
     // and no segment of it is an endpoint alias - otherwise the watched snapshot would sit
     // inside a recursively watched tree and re-introduce the loop this design removes.
     assert!(!snapshot.starts_with(manifest));

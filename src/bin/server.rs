@@ -13,24 +13,10 @@
 //! loopback start. The banner therefore never prints the bind answer (`0.0.0.0`) as a
 //! URL - it prints loopback URLs for this machine plus a detected LAN URL, and says
 //! plainly that binding is only half of cross-device reachability (see `banner_lines`).
-//!
-//! WASM: `scripts/build-wasm.mjs` runs `cargo build --target wasm32-unknown-unknown`
-//! without `--lib`, so this bin target is compiled for wasm32 too. It therefore
-//! carries a stub `main` under the wasm cfg, and everything touching axum/tokio sits
-//! inside the `cfg(not(wasm32))` module below - matching the target-gated
-//! dependencies in `Cargo.toml`.
 
 // ---------------------------------------------------------------------------
-// wasm stub: no listener, no runtime, nothing to serve. Compiles so `--all-targets`
-// stays green for the wasm check without pulling the native stack in.
+// Native runtime.
 // ---------------------------------------------------------------------------
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-fn main() {}
-
-// ---------------------------------------------------------------------------
-// Native runtime (the whole point of this target).
-// ---------------------------------------------------------------------------
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod native {
     use std::ffi::OsString;
     use std::io::ErrorKind;
@@ -1018,7 +1004,6 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn main() {
     // `run()` already picked an exit code; forwarding it verbatim is what keeps
     // "bad usage" distinguishable from "the port was taken".

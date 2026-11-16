@@ -14,20 +14,15 @@
 # ../../../.cargo/config.toml):
 #   target-dir = ".rust/target"          -> artifacts stay inside the repo
 #   [env] TMP/TEMP/TMPDIR = Temp/rust    -> child processes never touch OS temp
-#   wasm32-unknown-unknown rustflags -C target-feature=+simd128
-#   rust-toolchain.toml channel 1.99.1   -> pinned toolchain + wasm target
+#   rust-toolchain.toml channel 1.99.1   -> pinned toolchain
 #
-# One combined crate on purpose: the native core and its wasm boundary are the
-# same code, and the wasm-only dependency is target-gated below, so a host build
-# never compiles wasm-bindgen. Splitting core/wasm into two crates buys nothing at
-# this size - the native runtime deps (axum/tokio) are target-gated the SAME way,
-# so a wasm32 build compiles neither the server module nor the HTTP stack, and the
-# artifact stays exactly as small as it was before a server existed.
+# Native-only: this crate is an HTTP server, so there is no wasm boundary and no
+# wasm target. The native runtime deps (axum/tokio) are ordinary dependencies -
+# nothing is target-gated because there is only one target.
 # =============================================================================
 
 [workspace]
-# 3 = the edition-2024 default (matches the root workspace): per-target feature
-# resolution, which is what makes the target-gated wasm dependency below cheap.
+# 3 = the edition-2024 default (matches the root workspace).
 resolver = "3"
 
 [package]
@@ -39,46 +34,27 @@ edition = "2024"
 rust-version = "1.99"                              # same floor as the root workspace
 license = "MIT"
 publish = false                                    # crates.io: consumed by path, not published
-description = "Rust-native core for @typecrate/services, with an optional wasm32 boundary for JS hosts."
+description = "Rust-native core for @typecrate/services: the native HTTP server and its build-time route discovery."
 
 [lib]
 name = "typecrate_services"                        # in Rust code: `use typecrate_services::...`
 path = "src/lib.rs"
-# cdylib  -> the wasm32 artifact wasm-bindgen post-processes (a native cdylib is
-#            simply an extra dll, harmless and required to share one manifest).
-# rlib    -> native consumers (crate-to-crate linking, the default path) and `cargo test`.
-crate-type = ["cdylib", "rlib"]
+# rlib -> native consumers (crate-to-crate linking) and `cargo test`.
+crate-type = ["rlib"]
 
 # The native HTTP executable (R1). Declared explicitly so the artifact/bin name is
 # stable and greppable (`cargo run --bin typecrate-services-server`) instead of
 # cargo's autodiscovered `server`; naming a path here is also what stops
 # autodiscovery from creating a second target for the same file.
-# On wasm32 this same bin target is still built (build:wasm has no --lib), so
-# src/bin/server.rs keeps a cfg'd stub `main` and only links the runtime natively.
 [[bin]]
 name = "typecrate-services-server"
 path = "src/bin/server.rs"
 
 [dependencies]
-# Ungated dependencies stay EMPTY on purpose: the pure core (identity/echo) must
-# compile for wasm32 with nothing but wasm-bindgen. Everything the native runtime
-# needs is target-gated below.
-
-[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-# Compiled only for the wasm boundary, mirroring the root workspace's rule for
-# wasm-bindgen/js-sys/console_error_panic_hook (Cargo.toml "wasm boundary").
-wasm-bindgen = "0.2"
-
-# ---------------------------------------------------------------------------
-# Native runtime (the primary path), gated OFF wasm32 with the exact inverse of
-# the wasm-bindgen gate above: tokio's IO/time drivers and hyper's sockets do not
-# exist on wasm32-unknown-unknown, and `src/lib.rs` compiles `pub mod server` plus
-# the generated route table only when this cfg holds.
+# Native runtime. Versions/features mirror packages/underload/nexus
+# (crates/nexus-server) so the repo resolves one axum/tokio/serde/reqwest graph,
+# not two parallel ones.
 #
-# Versions/features mirror packages/underload/nexus (crates/nexus-server) so the
-# repo resolves one axum/tokio/serde/reqwest graph, not two parallel ones.
-# ---------------------------------------------------------------------------
-[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 # `json` + `query` are the extractors the service endpoints actually use (POST JSON
 # bodies, GET query strings); axum's default features already bring http1 + tokio,
 # which is what `axum::serve` in src/bin/server.rs needs.
@@ -101,17 +77,9 @@ serde_json = "1"
 # `typecrate_harness::api::{handle_request, handle_stream}` - so the harness library has to link
 # here. The edge points one way only: `typecrate-harness` has no dependency on services (its
 # manifest lists no path dependencies at all), so this cannot form a cycle.
-#
-# Same gate as every other line in this section, which is the exact inverse of the wasm-bindgen
-# gate above (`cfg(not(all(target_arch = "wasm32", target_os = "unknown")))`). It is the LONGER
-# spelling of the brief's `cfg(not(target_arch = "wasm32"))`, and it is the one this manifest
-# already uses: one gate table for the whole native runtime, and `cargo check --target
-# wasm32-unknown-unknown` still compiles neither the harness nor its axum/tokio/reqwest stack
-# (asserted by that check, and by `src/lib.rs` compiling `pub mod server` - the type the route
-# file names - under the same cfg).
 typecrate-harness = { path = "../harness" }
 
-[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
+[dev-dependencies]
 # tests/server_http.rs dials the real listener over a real TCP socket; no stubbed
 # transport. No TLS feature: every test URL is http://127.0.0.1:<ephemeral>.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
@@ -119,13 +87,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # `build_support/` into the TEST crate with `#[path]` (a build script has no rlib an
 # integration test can link), and a build-dependency is not visible to any other
 # target - so the same version is declared here too, for native test builds.
-# Same target gate as reqwest: tests/discovery.rs is `#![cfg(not(wasm32))]`, so the
-# wasm `--all-targets` check never sees this crate.
 ignore = "0.4"
 # tests/harness_gateway.rs (T6) completes the `harness.v1` handshake over the SAME router the
 # executable serves, which needs an RFC 6455 client. The same version the harness crate already
-# resolves for its own stream suite (`packages/typecrate/harness/Cargo.toml` dev-deps), and the
-# same target gate as reqwest above, so the wasm `--all-targets` check never sees this crate.
+# resolves for its own stream suite (`packages/typecrate/harness/Cargo.toml` dev-deps).
 tokio-tungstenite = "0.29"
 # `WebSocketStream` is a `futures` `Stream` + `Sink` (tokio-tungstenite 0.29 exposes no inherent
 # send/recv and re-exports nothing from futures), so the frame conversation needs these two extension
@@ -148,9 +113,7 @@ unsafe_code = "forbid"
 all = { level = "warn", priority = -1 }
 
 # Release profile mirrors the root workspace ([profile.release]): this workspace is
-# separate, so the settings have to be restated for the wasm artifact to be small.
-# panic = "abort": wasm32-unknown-unknown is abort-only (unwinding needs nightly);
-# cargo still forces unwind for the test profile, so assertions report normally.
+# separate, so the settings have to be restated.
 [profile.release]
 opt-level = 3
 lto = "fat"

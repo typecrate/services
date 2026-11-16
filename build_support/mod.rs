@@ -8,7 +8,7 @@
 //!   linked as an rlib, so an integration test otherwise cannot assert on the rules at
 //!   all - they would only be observable through a generated file.
 //! * `src/` never touches it: scanning is build-time only, so neither filesystem walking
-//!   nor the `ignore` crate can leak into the `wasm32-unknown-unknown` artifact (R4).
+//!   nor the `ignore` crate can leak into the compiled crate (R4).
 //!
 //! A separate internal crate was rejected on purpose: it would add a workspace member
 //! (manifest churn) and a published-internal crate, for zero gain - the `#[path]`

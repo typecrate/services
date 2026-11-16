@@ -33,11 +33,6 @@
 //! as dispatches - the literal `ANY` verb, answered by the harness dispatcher - while the REST
 //! catalogue and the `harness.v1` upgrade behind them are proven end to end in
 //! `tests/harness_gateway.rs`.
-//!
-//! Compiled only for non-wasm targets: axum/tokio/reqwest are target-gated in
-//! `Cargo.toml`, so the crate root cfg below makes this an empty test crate for
-//! `cargo check --target wasm32-unknown-unknown --all-targets`.
-#![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 
 use std::fs;
 use std::io;

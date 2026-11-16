@@ -1,11 +1,10 @@
 # @typecrate/services
 
-Rust-first service core for the `typecrate` scope. The crate in this directory is
-the implementation; **native Rust is the default** (build / check / test / lint /
-run are all `cargo`, with no JS toolchain involved). JavaScript consumers get an
-**optional** WASM build: `cargo` produces the module and `wasm-bindgen --target web`
-generates the JS glue plus the TypeScript declarations that the npm entry points
-point at.
+Rust-first, native-only service core for the `typecrate` scope. The crate in this
+directory is the implementation; build / check / test / lint / run are all `cargo`
+(the npm scripts add the route-discovery pre-step through the root-hoisted
+`vite-node`). There is no wasm target and no JS entry point: the package is private
+and `package.json` exists so yarn/WebStorm can drive those scripts.
 
 Current phase: the service **framework** is in place — a runnable native HTTP
 executable, build-time route discovery, shared state, and a sample endpoint set of
@@ -27,7 +26,7 @@ packages/typecrate/services/
   Cargo.lock                # committed: this workspace has its own lock (root lock is separate)
   build.rs                  # build-time scan of `*-route.rs` files -> $OUT_DIR/service_routes.rs
   build_support/            # the scanner + generator rules (shared with tests/discovery.rs)
-  src/lib.rs                # Rust core + the generated route table + the wasm boundary
+  src/lib.rs                # Rust core + the generated route table
   src/server/mod.rs         # AppState (shared state) + the axum `Router` factory + the embedded browser surface
   src/server/metadata.rs    # `EndpointMeta` + the `crate::service_routes!` macro (one entry -> route AND listing)
   src/server/playground.*   # the page/css/js `include_str!`d into the binary (served at `/`, `/playground.css`, `/playground.js`)
@@ -37,11 +36,8 @@ packages/typecrate/services/
   tests/api.rs              # native-consumption test (links the rlib like a downstream crate)
   tests/discovery.rs        # scanner/generator rules against real fixture trees
   tests/server_http.rs      # real-TCP HTTP tests of the exact library router
-  scripts/build-wasm.ts    # wasm artifact -> pkg/ glue + generated .d.ts
   scripts/discover-services.ts # pre-step: tree-shape snapshot -> Temp/ watched file
   scripts/check-playground.ts  # optional jsdom check of the embedded browser surface
-  examples/node-smoke.ts   # runs pkg/ glue in Node and asserts exact values
-  pkg/                      # generated (git-ignored): JS + .d.ts + .wasm
 ```
 
 The one artifact outside the package is the discovery snapshot,
@@ -51,7 +47,7 @@ The one artifact outside the package is the discovery snapshot,
 
 One discovered **route tree lives outside this package**: the repository-root scan also finds
 `packages/typecrate/harness/endpoint/harness/harness-route.rs`, the `/v1/harness` bridge, which
-calls into the sibling `typecrate-harness` crate (a non-wasm path dependency). That is what makes
+calls into the sibling `typecrate-harness` crate (a native path dependency). That is what makes
 the scan root the repository rather than this folder — see
 [Harness gateway](#harness-gateway-v1harness).
 
@@ -60,8 +56,8 @@ npm package lives (`packages/typecrate/services`), while the root workspace only
 globs `rust/crates/*`. The explicit boundary is what stops cargo from erroring
 `current package believes it's in a workspace when it's not` — the same shape
 `packages/underload/nexus` uses. Toolchain and cargo config still come from the
-repo root by directory walk-up: `rust-toolchain.toml` pins **1.99.1 +
-wasm32-unknown-unknown**, and `.cargo/config.toml` sets `target-dir = .rust/target`
+repo root by directory walk-up: `rust-toolchain.toml` pins the **1.99.1**
+toolchain, and `.cargo/config.toml` sets `target-dir = .rust/target`
 plus `TMP/TEMP/TMPDIR = Temp/rust`.
 
 Naming: crate `typecrate-services` == npm `@typecrate/services` with `@` dropped
@@ -69,7 +65,7 @@ and `/` replaced by `-` (rust/README.md naming rule); in Rust code it is
 `use typecrate_services::...`. Version `1.0.2` is the single line for both —
 `tests::version_matches_the_npm_line` fails if they drift.
 
-## Native service (default)
+## Native service
 
 ```bash
 yarn workspace @typecrate/services run-native    # discovery snapshot, then cargo run --bin typecrate-services-server --locked --
@@ -255,9 +251,7 @@ From another device the same URLs are
 `http://<this machine's LAN ip>:5001/` and
 `http://<this machine's LAN ip>:5001/v1/services/routes` — see the bind/firewall notes
 above for what makes that reachable in practice. All four builtins are part of the
-*native* router only: on `wasm32-unknown-unknown` the server module is compiled out, so
-a WASM consumer has the `crateName`/`version`/`echo` boundary and no HTTP surface at
-all.
+native router.
 
 ### The playground
 
@@ -519,15 +513,13 @@ upgrade, and that the STATIC `/v1/harness/stream` wins over the `{*rest}` catch-
 handlers answer a wrong verb with two different sentences, so a precedence regression cannot hide
 behind a status code).
 
-The dependency is a **path dependency under the non-wasm gate**, next to axum/tokio/serde:
+The dependency is a **path dependency**, next to axum/tokio/serde:
 
 ```toml
-[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+[dependencies]
 typecrate-harness = { path = "../harness" }
 ```
 
-so `npm run wasm:check` compiles neither the harness nor its axum/tokio/reqwest stack — on
-`wasm32-unknown-unknown` the generated table (and with it the route file) is not included at all.
 The edge points one way only: `typecrate-harness` declares no path dependencies, so there is no
 cycle. axum's `ws` feature is enabled here for the same reason — the discovered module and the
 harness library compile axum as one build unit, and `/v1/harness/stream` upgrades.
@@ -862,136 +854,28 @@ into the crate, so `npm run lint:strict` lints it like hand-written code, and th
 attribute is per-declaration to keep the full lint over every clean route file.
 
 Any extra crate a route file needs (an extractor, a template engine, a client) — or the
-core file it pulls in needs — is a **dependency of this package's `Cargo.toml`**, under the
-`cfg(not(all(target_arch = "wasm32", target_os = "unknown")))` target — route files
-compile into the native crate, and a dependency outside that gate also has to build
-for `wasm32-unknown-unknown`.
+core file it pulls in needs — is a **dependency of this package's `Cargo.toml`**: route
+files compile into this crate.
 
 ## Scripts
 
 | Script | Command | Gate |
 | --- | --- | --- |
-| `discover` | `vite-node scripts/discover-services.ts` | native: rewrites the watched discovery snapshot (`--force`, `--print`) || `build` | `vite-node scripts/discover-services.ts && cargo build --release --locked` | native: rlib + cdylib + the server executable |
+| `discover` | `vite-node scripts/discover-services.ts` | native: rewrites the watched discovery snapshot (`--force`, `--print`) || `build` | `vite-node scripts/discover-services.ts && cargo build --release --locked` | native: rlib + the server executable |
 | `start`, `run-native` | `vite-node scripts/discover-services.ts && cargo run --bin typecrate-services-server --locked --` | native: forwards everything after `npm … --` |
 | `check` | `vite-node scripts/discover-services.ts && cargo check --workspace --all-targets --locked` | native |
 | `check:ui` | `vite-node scripts/check-playground.ts` | **optional**, JS: drives the embedded page in jsdom (the workspace root's copy; `--base <origin>` runs the same suite against a live server). Not part of `verify`, which stays JS-free |
 | `test` | `vite-node scripts/discover-services.ts && cargo test --workspace --locked` | native: unit + discovery + real-socket HTTP |
 | `lint` | `cargo clippy --workspace --all-targets --locked` | what root `turbo run test` executes; must not deny warnings |
 | `lint:strict` | the same with `-D warnings` | CI/verify gate (it lints the generated module too) |
-| `fmt`, `fmt:check` | `cargo fmt --all [-- --check]` | native |
+| `fmt`, `fmt:check` | `cargo fmt -p typecrate-services [-- --check]` | native |
 | `verify` | `fmt:check` + `lint:strict` + `test` + `build` | **native gate** |
-| `wasm:check` | `cargo check --target wasm32-unknown-unknown --all-targets --locked` | WASM cross-compile |
-| `build:wasm` | `vite-node scripts/build-wasm.ts` | WASM: artifact + glue + declarations |
-| `smoke:wasm` | `vite-node examples/node-smoke.ts` | WASM: runs `pkg/` in Node, exact values |
-| `verify:wasm` | `wasm:check` + `build:wasm` + `smoke:wasm` | **WASM chain**, secondary |
-| `prepack` | `npm run build:wasm` | `npm pack`/`publish` cannot ship dead entry paths |
 
 Every cargo script runs `--locked` against the committed `Cargo.lock` (this
 workspace has its own lock; the root workspace keeps a separate one), so a build
-never re-resolves dependencies — which also matters for the WASM path, because the
-`wasm-bindgen` CLI has to match the version recorded in that lock. If the lock is
+never re-resolves dependencies. If the lock is
 missing or predates a manifest change, cargo stops and you regenerate on purpose
 with `cargo generate-lockfile`.
-
-## WASM (secondary)
-
-The WASM module is the published npm surface today: `npm pack` ships `pkg/` (glue +
-declarations + `.wasm`) plus `scripts/`, `examples/` and this README, but **no
-`src/` and no `Cargo.toml`** — the native server is a repository-level artifact,
-built from this directory. The same `src/lib.rs`
-compiles for both: the server module, the generated route table and the
-axum/tokio stack are gated to non-wasm targets, and `src/bin/server.rs` carries an
-empty `main` for the wasm target so `build:wasm` still cross-compiles.
-
-Prerequisites — the pipeline builds nothing by itself and installs nothing:
-
-1. Rust 1.99.1 with the wasm target: `rustup toolchain install` (reads
-   `rust-toolchain.toml`).
-2. The `wasm-bindgen` **CLI**, at exactly the version `Cargo.lock` pins the
-   `wasm-bindgen` library at (currently `0.2.130`). It is not a cargo subcommand
-   and rustup does not manage it:
-
-   ```bash
-   cargo install wasm-bindgen-cli --locked --version 0.2.130
-   ```
-
-   or unpack the matching prebuilt release into `.rust/bin` (`rust/README.md`'s
-   local tool home). An arbitrary location works too: set
-   `TYPECRATE_WASM_BINDGEN=/path/to/wasm-bindgen`. `scripts/build-wasm.ts` reads
-   the pin out of `Cargo.lock` and refuses a CLI whose version differs, instead of
-   letting the generated loader panic later.
-
-```bash
-yarn workspace @typecrate/services wasm:check
-yarn workspace @typecrate/services build:wasm
-yarn workspace @typecrate/services smoke:wasm
-```
-
-`TYPECRATE_WASM_DEBUG=1` in front of `build:wasm` builds the unoptimised artifact
-instead of the release one (cargo has no `--debug` flag: the debug profile is the
-default, so the script simply omits `--release`).
-
-`build:wasm` writes `pkg/typecrate_services.js` (ESM glue),
-`pkg/typecrate_services.d.ts` (generated declarations) and
-`pkg/typecrate_services_bg.wasm`, and fails if any of them is missing or does not
-export/declare `crateName`, `version` and `echo`. Because `pkg/` is git-ignored, a
-fresh clone has to run `build:wasm` before the JS entry points resolve.
-
-The generated entry's **default export is the init function** (`__wbg_init` in the
-`0.2.130` output this lock pins). With no argument it loads the sibling
-`typecrate_services_bg.wasm` through its own module URL; with an argument it accepts
-a `URL`, a `Request`, a `Response`/`WebAssembly.Module`/bytes, or a
-`{ module_or_path }` object — passing the value directly instead of in an object
-prints `using deprecated parameters for the initialization function` (the shipped
-`examples/node-smoke.ts` still does that, so `smoke:wasm` prints the notice; the
-object form is the one to copy).
-
-`--target web` is deliberate (see `rust/README.md` "One artifact, both runtimes"):
-one module for browser **and** Node, no bundler plugins, no CommonJS-only build,
-and no `wasm-pack` (unmaintained by the wasm-bindgen team, and it would overwrite
-this hand-authored `package.json`).
-
-### Browser
-
-```ts
-import init, { echo, version } from "@typecrate/services";
-
-// No argument: the glue locates `typecrate_services_bg.wasm` relative to its own
-// module URL, which is what keeps one artifact working for browser and Node.
-await init();
-
-version(); // "1.0.2"
-echo("identity"); // "identity"
-```
-
-Pass an argument only when the host deliberately places the asset somewhere the
-module URL cannot resolve (own CDN path, prefetched `Response`,
-`WebAssembly.Module`).
-
-### Node
-
-Node's `fetch` cannot read `file:` URLs, so pass the bytes
-(`examples/node-smoke.ts` is the runnable version of this):
-
-```js
-import { readFileSync } from "node:fs";
-import init, { echo } from "@typecrate/services";
-await init({ module_or_path: readFileSync("./node_modules/@typecrate/services/pkg/typecrate_services_bg.wasm") });
-echo("identity"); // "identity"
-```
-
-### Module format: ESM only
-
-The package is `"type": "module"` and `exports` publishes a single `import`
-condition (`./pkg/typecrate_services.js`, typed by `./pkg/typecrate_services.d.ts`)
-with no `require` condition and no CJS fallback — wasm-bindgen `--target web`
-emits ES modules. A CommonJS host therefore cannot `require("@typecrate/services")`;
-it has to go through `await import("@typecrate/services")`. There is also no
-`development`/source condition: the old Vite-era `index.ts` entry is gone, so every
-consumer resolves the generated artifact (run `build:wasm` first).
-
-The wasm build carries `-C target-feature=+simd128` from the root cargo config, so
-the support floor is Chrome 91+ / Firefox 90+ / Safari 16+ / Node 16+.
 
 ## Scope and parity gaps
 
@@ -1038,24 +922,15 @@ This milestone is the framework, not the migration:
   stack. The `1 MiB` `DefaultBodyLimit` governs the extractor endpoints; the harness route is not
   clipped by it and keeps its own `1 000 000` byte cap and its `16 MiB` submit cap (see
   [Gateway headers, preflights and body limits](#gateway-headers-preflights-and-body-limits)).
-- **WASM does not serve.** On `wasm32-unknown-unknown` the server module and the
-  generated table are compiled out, so the module keeps the
-  `crateName`/`version`/`echo` boundary and its `main` is an empty stub.
-
-Known, accepted noise on the WASM path today: `wasm-bindgen` reports
-`the target_features custom section is missing, likely due to strip = true` (the
-release profile strips symbols for size, so the CLI cannot record which Wasm
-features the module needs), and `smoke:wasm` prints the init-deprecation notice
-above. Neither affects the native milestone.
 
 ## Notes
 
 - `Cargo.lock` belongs to this standalone workspace and is committed; the root
-  workspace keeps its own. Every cargo script and `scripts/build-wasm.ts` pass
-  `--locked`, so the graph (and the `wasm-bindgen` version the CLI must match) only
+  workspace keeps its own. Every cargo script passes
+  `--locked`, so the graph only
   changes when someone runs `cargo generate-lockfile` on purpose.
 - Turbo (root `turbo.json`) caches `build` outputs as `dist/**`; this package's
-  outputs are `pkg/**` and `.rust/target`, so turbo runs the scripts but does not
+  outputs are `.rust/target`, so turbo runs the scripts but does not
   cache the Rust artifacts (cargo does that). The same is true of
   `packages/underload/nexus`.
 - The old TypeScript/Vite scaffold (`index.ts`, `vite.config.ts`, `tsconfig*.json`,

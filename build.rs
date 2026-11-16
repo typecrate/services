@@ -2,10 +2,7 @@
 //! `$OUT_DIR/service_routes.rs`, the module the crate root includes.
 //!
 //! * Runs on the host only (cargo compiles build scripts for the host), so the `ignore`
-//!   crate and filesystem walking can never reach the wasm artifact (R4). It still runs
-//!   for a `--target wasm32-unknown-unknown` build, where the generated file is simply not
-//!   included by anything: scanning anyway keeps one behaviour for every target and makes
-//!   a misconfigured `TYPECRATE_SERVICES_ROUTE_ROOT` fail the same way everywhere.
+//!   crate and filesystem walking never reach the compiled crate (R4).
 //! * There is no runtime route registry: a discovered file is compiled in, so an invalid
 //!   route is a native compile error pointing at that route file.
 //! * Everything interesting lives in `build_support/` (shared with `tests/discovery.rs`);

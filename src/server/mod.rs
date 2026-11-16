@@ -29,8 +29,8 @@
 //! and `tests/server_http.rs` can serve it on an ephemeral port, without either
 //! inventing a second copy of the route table.
 //!
-//! Compiled only for non-wasm targets (gate in `src/lib.rs`); the axum/tokio
-//! dependencies are target-gated in `Cargo.toml` the same way.
+//! This module is part of the native-only library (see `src/lib.rs`); the axum/tokio
+//! dependencies are ordinary dependencies in `Cargo.toml`.
 
 use std::path::{Component, Path, PathBuf};
 
