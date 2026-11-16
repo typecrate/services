@@ -83,7 +83,7 @@ cargo run --bin typecrate-services-server --locked -- --help   # the same, witho
 
 | Setting | Flag | Environment | Default |
 | --- | --- | --- | --- |
-| Bind address | `-a, --addr <ip[:port]>`, `--port <port>` | `TYPECRATE_SERVICES_ADDR` | `0.0.0.0:5001` |
+| Bind address | `-a, --addr <ip[:port]>`, `--port <port>` | `TYPECRATE_SERVICES_ADDR` | `0.0.0.0:8000` |
 | Writable data root | `--database-root <dir>` | `TYPECRATE_SERVICES_DATABASE_ROOT` | `<repo-parent>/temporary/dump` |
 | Request body cap | — (constant) | — | `1 MiB` (`server::MAX_REQUEST_BODY_BYTES`) |
 
@@ -93,14 +93,14 @@ and an IPv6 address is written `[::1]:7007`.
 
 Security posture, deliberately:
 
-- **reachable from the LAN by default** — `0.0.0.0:5001` binds every interface, the
+- **reachable from the LAN by default** — `0.0.0.0:8000` binds every interface, the
   same surface the TS gateway publishes, so a phone or a second machine can open the
   playground without configuration. `--addr 127.0.0.1` (or
-  `TYPECRATE_SERVICES_ADDR=127.0.0.1:5001`) is the opt-in for a machine that must
+  `TYPECRATE_SERVICES_ADDR=127.0.0.1:8000`) is the opt-in for a machine that must
   stay loopback-only.
-- **which URL to use** — `http://127.0.0.1:5001/` on the machine that runs the
+- **which URL to use** — `http://127.0.0.1:8000/` on the machine that runs the
   server (`0.0.0.0` is a bind answer, not a URL), `http://<this machine's LAN
-  ip>:5001/` from anything else. The startup banner prints the loopback URLs plus the
+  ip>:8000/` from anything else. The startup banner prints the loopback URLs plus the
   LAN address it detects, and the explicit `--addr <ip>` form pins the answer when
   the host has several interfaces (VPN, dock, second NIC).
 - **binding is only half of reachability** — Windows Firewall, the network profile
@@ -113,7 +113,7 @@ Security posture, deliberately:
   Origin/CORS gate, so this server belongs on a trusted LAN, not on the public
   internet (no reverse proxy or tunnel in front of it yet).
 - **plain HTTP, no TLS** — the listener answers HTTP/1.1 in the clear, so a browser
-  shows its usual "Not secure" warning at `http://<LAN ip>:5001/` and an HTTPS-only
+  shows its usual "Not secure" warning at `http://<LAN ip>:8000/` and an HTTPS-only
   page cannot call it. Cosmetic for a LAN tool, but it also means anything typed into
   the playground — a header value, a body — crosses the network unencrypted, so do not
   send a secret you would not show a colleague on the same Wi-Fi.
@@ -126,11 +126,11 @@ Security posture, deliberately:
   REST samples). The one path-like value a response carries is the `location` header of a
   `201`, and that is a URL path on this same origin, not a directory below the root.
 - **nothing is ever killed** — a start fails with exit 1 only when **that address and
-  port** are already bound (`cannot bind 0.0.0.0:5001 - address already in use`), never
+  port** are already bound (`cannot bind 0.0.0.0:8000 - address already in use`), never
   by killing somebody. "That address" matters on Windows: a bind to a *specific*
   interface can still succeed while another process holds the wildcard on the same port,
-  e.g. a second instance started with `--addr 127.0.0.1 --port 5001` next to a running
-  `0.0.0.0:5001`. Both are then listening, and the more specific socket wins the
+  e.g. a second instance started with `--addr 127.0.0.1 --port 8000` next to a running
+  `0.0.0.0:8000`. Both are then listening, and the more specific socket wins the
   connections for its interface, so the new instance silently takes loopback while the
   older one keeps the LAN address. That is a valid setup only when it is the one you
   meant: **run parallel instances on distinct `--port` values** (the banner always prints
@@ -141,19 +141,32 @@ asserted line-by-line in its unit tests, while the LAN line is whatever the inte
 probe found and stays a placeholder when the host has no routable address):
 
 ```text
-typecrate-services-server listening on 0.0.0.0:5001 - every interface
+typecrate-services-server listening on 0.0.0.0:8000 - every interface
   database root:    <repo-parent>/temporary/dump
   max request body: 1048576 bytes
   routes:           generated at build time (Ctrl+C to stop)
-  playground:       http://127.0.0.1:5001/
-  endpoint list:    http://127.0.0.1:5001/v1/services/routes
-  other devices:    http://192.168.1.20:5001/
+  playground:       http://127.0.0.1:8000/
+  endpoint list:    http://127.0.0.1:8000/v1/services/routes
+  other devices:    http://192.168.1.20:8000/
   note:             unauthenticated - trusted LAN only, never the public internet; Windows Firewall may prompt on first start
+  listener 8010:    http://127.0.0.1:8010 - GET /v1/services/health
 ```
 
-A `--addr 127.0.0.1` start replaces the last two lines with
+The last line is the extra listener the compiled-in route table declares (the `health`
+sample writes its second `, port: 8010` group), and there is exactly one such line per
+distinct declared port — `server::declared_ports()` is where the bin reads them, so the
+banner cannot advertise a listener the routes did not ask for, and a build with no declared
+port prints no listener line at all (byte-identical to the single-listener banner). The paths
+named on that line are the ones mounted there: the four builtins are default-listener only,
+and so are every group that declares no port.
+
+A `--addr 127.0.0.1` start replaces the `other devices:`/`note:` pair with
 `other devices: none - bound to 127.0.0.1 (loopback only)` and a
-`next: --addr 0.0.0.0 (the default) publishes :5001 on every interface` hint.
+`next: --addr 0.0.0.0 (the default) publishes :8000 on every interface` hint; the
+`listener 8010:` line still follows, because an extra listener is bound on the same
+address the default listener was given. A declared port that equals the port this process
+binds is a startup refusal with exit `1` naming both sides — two listeners cannot share one
+socket, and the fix is `--port` or the route file, never a silent choice by the server.
 
 Exit codes: `0` clean shutdown (Ctrl+C, SIGTERM on unix, after draining in-flight
 requests), `1` could not serve, `2` bad usage (`--help` prints usage and exits `0`).
@@ -182,13 +195,13 @@ the package's HTTP tests, `tests/server_http.rs`).
 | `GET` | `/` | the interactive playground: one embedded HTML page, served from **this** origin with **no external assets** (no CDN, no separate static mount), which then calls the endpoints on the same origin |
 | `GET` | `/playground.css` | the page's stylesheet, `include_str!`d into the executable (the document carries no inline `<style>`, which is what keeps the strict CSP honest) |
 | `GET` | `/playground.js` | the page's script, `include_str!`d into the executable (no inline `<script>`, and the DOM is built with `textContent`, never `innerHTML`) |
-| `GET` | `/v1/services/routes` | JSON listing of the compiled-in endpoints — one entry per registered route, each carrying `method`, `path` and `summary`, i.e. exactly what the playground offers |
+| `GET` | `/v1/services/routes` | JSON listing of the compiled-in endpoints — one entry per mounted `(method, path, port)`, each carrying `method`, `path` and `summary` plus `port` only for a group that declared one, i.e. exactly what the playground offers. The table is **not** filtered by port, so it describes every listener this process compiles in; it is itself served only on the default listener, because the builtins are not mounted on a declared one |
 
 ```bash
-curl -i http://127.0.0.1:5001/                     # playground HTML (same origin)
-curl -i http://127.0.0.1:5001/playground.css       # the embedded stylesheet
-curl -i http://127.0.0.1:5001/playground.js        # the embedded script
-curl -s http://127.0.0.1:5001/v1/services/routes   # the endpoint listing
+curl -i http://127.0.0.1:8000/                     # playground HTML (same origin)
+curl -i http://127.0.0.1:8000/playground.css       # the embedded stylesheet
+curl -i http://127.0.0.1:8000/playground.js        # the embedded script
+curl -s http://127.0.0.1:8000/v1/services/routes   # the endpoint listing
 ```
 
 Every one of those four responses carries `Cache-Control: no-store` (they are compiled
@@ -198,20 +211,23 @@ into the binary, so a cached copy is a different version of the tool),
 second origin — the playground therefore works on a LAN with no internet, and a
 response body full of markup is displayed as text rather than executed.
 
-The listing is the compiled-in set only, so today it is eighteen rows: the three `ANY`
+The listing is the compiled-in set only, so today it is nineteen rows: the three `ANY`
 rows of the [harness gateway](#harness-gateway-v1harness) plus this package's fifteen sample
 routes — the two `echo` ones, `health`, and the six routes each REST sample compiles in
-(`locations` and `pets`, one row per `GET`/`POST`/`GET`/`PUT`/`PATCH`/`DELETE`). Every other
+(`locations` and `pets`, one row per `GET`/`POST`/`GET`/`PUT`/`PATCH`/`DELETE`) — plus the
+one demo row that declares a port: `health` is written twice in its route file, once for the
+default listener and once with `, port: 8010`, and the listing is **not filtered by port**, so
+one row per mounted `(method, path, port)` means that path legitimately appears twice. Every other
 `@underload/service` endpoint is still only on the TS gateway. Its rows are
 **generated**, not hand-maintained: each route file declares its endpoints once through
 `crate::service_routes!`, which emits both the `register` fn and that module's
 `ENDPOINTS` slice from the same tokens (see
 [Routes are compiled in at build time](#routes-are-compiled-in-at-build-time)), and the
 generated `route_metadata()` concatenates those slices in registration order. A row is
-`method`/`path`/`summary` only — no module identifier, no scan root, no `#[path]` — so
-the listing is safe to serve on the LAN. The four builtins above are deliberately not
-part of it: the listing answers "what endpoints does this build compile in", not "what
-does the socket accept".
+`method`/`path`/`summary`, plus `port` only when its group declared one — no module
+identifier, no scan root, no `#[path]` — so the listing is safe to serve on the LAN. The four
+builtins above are deliberately not part of it: the listing answers "what endpoints does this
+build compile in", not "what does the socket accept".
 
 That answer in full, in registration order. On the wire it is one compact array; it is
 split here one row per line so the whole set is readable, and every summary is verbatim
@@ -224,6 +240,7 @@ the text its route file declares:
 {"method":"POST","path":"/v1/services/echo","summary":"Echoes the posted `value` unchanged"},
 {"method":"GET","path":"/v1/services/echo/{value}","summary":"Echoes `{value}`, with `?prefix=` applied"},
 {"method":"GET","path":"/v1/services/health","summary":"Reports the service name and version"},
+{"method":"GET","path":"/v1/services/health","summary":"Reports the service name and version on the isolated 8010 listener","port":8010},
 {"method":"GET","path":"/v1/services/locations","summary":"Lists every stored location, `?city=` narrows by exact city"},
 {"method":"POST","path":"/v1/services/locations","summary":"Creates a location and answers 201 with it"},
 {"method":"GET","path":"/v1/services/locations/{id}","summary":"Returns one location by id, or 404 when the id is unknown"},
@@ -242,14 +259,36 @@ The order is the scanner's byte-wise order of the route files, so
 `packages/typecrate/harness/endpoint/harness/harness-route.rs` comes first (T6), then
 `endpoints/echo/echo-route.rs`, `health-route.rs`, `locations-route.rs` and `pets-route.rs` — the
 `*-core.rs` files sitting next to them are never scanned, so they cannot change this order; inside
-one route file it is the order of the `crate::service_routes!` entries. And the set is not only
-prose: `scripts/check-playground.ts` pins it row-by-row in rail order (`LISTING_JSON`), so
+one route file it is the order of the `crate::service_routes!` groups, and inside a group the order
+of its verbs — which is why the two `health` rows sit next to each other, the unported one first.
+The `port` key appears on exactly one row, last, and never as `"port": null`: a group that declares
+no port simply omits the key (`EndpointMeta`'s last field carries
+`skip_serializing_if = "Option::is_none"`, so no pre-port row changed shape). And the set is not
+only prose: `scripts/check-playground.ts` pins it row-by-row in rail order (`LISTING_JSON`), so
 `npm run check:ui -- --base <origin>` fails the moment a running server lists a different
-method, path or summary.
+method, path, summary or port.
+
+**There is no OpenAPI document, and that is the answer for a path on two listeners.** This crate
+generates no OpenAPI surface at all — no `utoipa`/`async-openapi` dependency, no `#[endpoint]`
+attribute, no `OpenApi` value anywhere in `src/` — so the listing above *is* the machine-readable
+description a build publishes, and a consumer that wants one reads `GET /v1/services/routes`.
+Why that matters for the duplicated path: an OpenAPI **path item is keyed by path alone**, so the
+two `GET /v1/services/health` declarations would have collapsed into one entry with one surviving
+summary, and which summary survived would be an accident of the generator. The listing has no such
+key. It is an ordered array with no merge and no last-write-wins, so both declarations are
+published verbatim, in declaration order, and what tells them apart is the `port` key plus their
+deliberately different summaries. The listing is also **not scoped to a listener** — it describes
+every listener the process compiles in, while being mounted only on the default one — so "what
+runs on 8010" is a filter on the `port` key, not a per-port document. Per-port `servers` entries
+were considered and rejected: they would mean inventing an OpenAPI document this service does not
+have, rather than describing the one it does. `tests/server_http.rs` pins the settlement exactly:
+both rows as full tuples in declaration order, and no
+`openapi`/`paths`/`servers`/`components` key anywhere in the published bytes
+(`a_path_declared_on_two_ports_is_described_twice_and_never_merged`).
 
 From another device the same URLs are
-`http://<this machine's LAN ip>:5001/` and
-`http://<this machine's LAN ip>:5001/v1/services/routes` — see the bind/firewall notes
+`http://<this machine's LAN ip>:8000/` and
+`http://<this machine's LAN ip>:8000/v1/services/routes` — see the bind/firewall notes
 above for what makes that reachable in practice. All four builtins are part of the
 native router.
 
@@ -261,7 +300,19 @@ What `GET /` actually does (`src/server/playground.js`, no framework, no build s
   every row into a searchable rail (`method`, `path`, `summary`); the search box filters
   all three fields. Nothing else is sent until you press Send, so opening the tool cannot
   call a write endpoint by accident. The first listed entry is loaded into the composer so
-  the tool is usable without a click. If that one request fails, the reason stays on
+  the tool is usable without a click. A path published on two listeners is listed twice and
+  shown twice, and the rail names the listener each row belongs to: a row whose group declared
+  a port renders that port as its own marker and carries it in its accessible name, while a row
+  with no declared port renders no marker at all — the absence is what says "default listener".
+  Selecting a ported row also states, in the composer's state line, that **Send is dispatched on
+  this origin and never on that port**: the page is served only by the default listener and fetches
+  `mode: "same-origin"`, so its marker names the listener the route was declared for, not the one
+  that answers — the marker and that sentence are pinned as exact text
+  (`scripts/check-playground.ts`). Cross-origin fetching is deliberately not implemented, so the
+  honest option was wording, not a second origin in the CSP.
+  Selection is keyed on the row's index in the listing rather than on `method` + `path`, so a
+  duplicated path can have exactly one current row, one per listener
+  (`scripts/check-playground.ts` pins the marker text and that count). If that one request fails, the reason stays on
   screen — it survives filter keystrokes — together with a **Try again** button that
   re-runs the request in place, so a restart of the server needs no reload of the page.
 - **Method badges are class-coloured, never styled from text.** `get`/`head` read as
@@ -306,7 +357,7 @@ What `GET /` actually does (`src/server/playground.js`, no framework, no build s
   CSP therefore grants no `'unsafe-inline'` and no second origin.
 
 Drive it without a browser: `npm run check:ui` (hermetic) or
-`npm run check:ui -- --base http://127.0.0.1:5001` against a running server — see
+`npm run check:ui -- --base http://127.0.0.1:8000` against a running server — see
 [Scripts](#scripts).
 
 ### Endpoints as they behave on the wire
@@ -370,10 +421,10 @@ body that does not fit the record — a missing `age`, or `"age":"three"` — is
 and the `1 MiB` cap still answers `413` first (see the security notes above).
 
 ```bash
-curl -i http://127.0.0.1:5001/v1/services/health
-curl -i "http://127.0.0.1:5001/v1/services/echo/there?prefix=pre-"   # {"value":"pre-there"}
+curl -i http://127.0.0.1:8000/v1/services/health
+curl -i "http://127.0.0.1:8000/v1/services/echo/there?prefix=pre-"   # {"value":"pre-there"}
 curl -i -X POST -H 'Content-Type: application/json' \
-     --data '{"value":"round-trip"}' http://127.0.0.1:5001/v1/services/echo
+     --data '{"value":"round-trip"}' http://127.0.0.1:8000/v1/services/echo
 ```
 
 A multi-byte path segment survives routing and serialisation
@@ -384,34 +435,34 @@ The `pets` sample end to end, i.e. the walkthrough the statuses above describe:
 
 ```bash
 curl -i -X POST -H 'Content-Type: application/json' \
-     --data '{"name":"Rex","species":"dog","age":3}' http://127.0.0.1:5001/v1/services/pets
+     --data '{"name":"Rex","species":"dog","age":3}' http://127.0.0.1:8000/v1/services/pets
 #   201 Created
 #   location: /v1/services/pets/1
 #   {"id":1,"name":"Rex","species":"dog","age":3}
 
-curl -s http://127.0.0.1:5001/v1/services/pets/1   # 200 {"id":1,"name":"Rex","species":"dog","age":3}
-curl -s http://127.0.0.1:5001/v1/services/pets     # 200 [{"id":1,"name":"Rex","species":"dog","age":3}]
-curl -s http://127.0.0.1:5001/v1/services/pets/7   # 404 {"error":"no pet with id 7"}
+curl -s http://127.0.0.1:8000/v1/services/pets/1   # 200 {"id":1,"name":"Rex","species":"dog","age":3}
+curl -s http://127.0.0.1:8000/v1/services/pets     # 200 [{"id":1,"name":"Rex","species":"dog","age":3}]
+curl -s http://127.0.0.1:8000/v1/services/pets/7   # 404 {"error":"no pet with id 7"}
 
 # PATCH writes only what it is sent: name and species stay exactly as they were.
 curl -i -X PATCH -H 'Content-Type: application/json' \
-     --data '{"age":4}' http://127.0.0.1:5001/v1/services/pets/1
+     --data '{"age":4}' http://127.0.0.1:8000/v1/services/pets/1
 #   200 {"id":1,"name":"Rex","species":"dog","age":4}
 
 # PUT replaces the record with what it is sent, and it does not create.
 curl -i -X PUT -H 'Content-Type: application/json' \
-     --data '{"name":"Rex","species":"dog","age":5}' http://127.0.0.1:5001/v1/services/pets/1
+     --data '{"name":"Rex","species":"dog","age":5}' http://127.0.0.1:8000/v1/services/pets/1
 #   200 {"id":1,"name":"Rex","species":"dog","age":5}
 curl -i -X PUT -H 'Content-Type: application/json' \
-     --data '{"name":"Max","species":"cat","age":1}' http://127.0.0.1:5001/v1/services/pets/7
+     --data '{"name":"Max","species":"cat","age":1}' http://127.0.0.1:8000/v1/services/pets/7
 #   404 {"error":"no pet with id 7"}
 
-curl -i -X DELETE http://127.0.0.1:5001/v1/services/pets/1
+curl -i -X DELETE http://127.0.0.1:8000/v1/services/pets/1
 #   204 No Content, empty body
 
-curl -s http://127.0.0.1:5001/v1/services/pets     # 200 []
+curl -s http://127.0.0.1:8000/v1/services/pets     # 200 []
 curl -i -X POST -H 'Content-Type: application/json' \
-     --data '{"name":"Rex","species":"dog","age":3}' http://127.0.0.1:5001/v1/services/pets
+     --data '{"name":"Rex","species":"dog","age":3}' http://127.0.0.1:8000/v1/services/pets
 #   201 {"id":1,...} - the store is empty again, so `max(stored id) + 1` is 1: the deleted
 #   highest id is handed straight back (see the id rule above)
 ```
@@ -421,34 +472,34 @@ The `locations` sample, where the list filter is the part worth pinning:
 ```bash
 curl -i -X POST -H 'Content-Type: application/json' \
      --data '{"name":"Flagship store","city":"Berlin","country":"DE"}' \
-     http://127.0.0.1:5001/v1/services/locations
+     http://127.0.0.1:8000/v1/services/locations
 #   201 Created
 #   location: /v1/services/locations/1
 #   {"id":1,"name":"Flagship store","city":"Berlin","country":"DE"}
 
 curl -i -X POST -H 'Content-Type: application/json' \
      --data '{"name":"Warehouse","city":"Hamburg","country":"DE"}' \
-     http://127.0.0.1:5001/v1/services/locations
+     http://127.0.0.1:8000/v1/services/locations
 #   201 Created
 #   location: /v1/services/locations/2
 #   {"id":2,"name":"Warehouse","city":"Hamburg","country":"DE"}
 
-curl -s "http://127.0.0.1:5001/v1/services/locations"
+curl -s "http://127.0.0.1:8000/v1/services/locations"
 #   200 [{"id":1,"name":"Flagship store","city":"Berlin","country":"DE"},
 #        {"id":2,"name":"Warehouse","city":"Hamburg","country":"DE"}]
 
-curl -s "http://127.0.0.1:5001/v1/services/locations?city=Berlin"
+curl -s "http://127.0.0.1:8000/v1/services/locations?city=Berlin"
 #   200 [{"id":1,"name":"Flagship store","city":"Berlin","country":"DE"}]
 
 # The match is exact, so case matters; an unknown key is tolerated, not an error.
-curl -s "http://127.0.0.1:5001/v1/services/locations?city=berlin&lang=en"
+curl -s "http://127.0.0.1:8000/v1/services/locations?city=berlin&lang=en"
 #   200 []
 
-curl -s "http://127.0.0.1:5001/v1/services/locations?city="
+curl -s "http://127.0.0.1:8000/v1/services/locations?city="
 #   200 the whole list again - an empty value is no filter
 
 curl -i -X PATCH -H 'Content-Type: application/json' \
-     --data '{"country":"DEU"}' http://127.0.0.1:5001/v1/services/locations/2
+     --data '{"country":"DEU"}' http://127.0.0.1:8000/v1/services/locations/2
 #   200 {"id":2,"name":"Warehouse","city":"Hamburg","country":"DEU"}
 ```
 
@@ -525,21 +576,21 @@ cycle. axum's `ws` feature is enabled here for the same reason — the discovere
 harness library compile axum as one build unit, and `/v1/harness/stream` upgrades.
 
 ```bash
-curl -s  http://127.0.0.1:5001/v1/harness            # the boot document
-curl -s  http://127.0.0.1:5001/v1/harness/health     # {"ok":true,"sessions":N,"epoch":"…"}
-curl -s  http://127.0.0.1:5001/v1/harness/sessions   # the paged collection (`items`/`limit`/…)
-curl -s  http://127.0.0.1:5001/v1/harness/tools      # the tool catalogue (`timeNow` is one row)
+curl -s  http://127.0.0.1:8000/v1/harness            # the boot document
+curl -s  http://127.0.0.1:8000/v1/harness/health     # {"ok":true,"sessions":N,"epoch":"…"}
+curl -s  http://127.0.0.1:8000/v1/harness/sessions   # the paged collection (`items`/`limit`/…)
+curl -s  http://127.0.0.1:8000/v1/harness/tools      # the tool catalogue (`timeNow` is one row)
 curl -s -X POST -H 'content-type: application/json' \
      -d '{"harness":"instruct"}' \
-     http://127.0.0.1:5001/v1/harness/sessions       # 201 + {"session":{…}}
-curl -s  http://127.0.0.1:5001/v1/services/routes    # the three `ANY` rows come FIRST
+     http://127.0.0.1:8000/v1/harness/sessions       # 201 + {"session":{…}}
+curl -s  http://127.0.0.1:8000/v1/services/routes    # the three `ANY` rows come FIRST
 ```
 
 and the stream, on the same listener as everything else — the subprotocol has to be offered, the
 `101` echoes it and carries `X-Harness-Epoch`:
 
 ```bash
-websocat -H 'Sec-WebSocket-Protocol: harness.v1' ws://127.0.0.1:5001/v1/harness/stream
+websocat -H 'Sec-WebSocket-Protocol: harness.v1' ws://127.0.0.1:8000/v1/harness/stream
 # → {"type":"welcome","protocol":"harness.v1","epoch":"…","limits":{…}}
 # → {"type":"subscribe","subscription_id":"s1","scope":"session","session_id":"<id>"}
 # → {"type":"subscription_state","subscription_id":"s1","epoch":"…",…}
@@ -578,17 +629,27 @@ reproduces the middleware stack of the TS host
   cap and its `16 MiB` cap on `POST /v1/harness/sessions/{id}/tasks`. All three behaviours are
   pinned by `tests/harness_gateway.rs::the_gateway_body_cap_governs_extractors_not_the_harness_route`.
 
-The one TS behaviour that is **not** reproduced is the gateway's `307` worker-redirect tier: it
-exists because the TS host forks one worker process per endpoint group, while this router serves
-every route in the process that owns the listener. Bind addresses and ports are unchanged.
+The two TS behaviours that are **not** reproduced are the gateway's `307` worker-redirect tier
+and the per-group **process forking** behind it: the TS host forks one worker process per
+endpoint group and answers a request that belongs to another group with a `307` to that group's
+port. This crate has the ports but neither the redirect nor the fork — every listener lives in
+**one process**, on one tokio runtime, and a request reaches its group only by being sent to that
+group's port in the first place. Nothing here forwards, proxies or redirects, so a client that
+dials the default listener gets the default listener's paths and a `404` for the rest. Bind
+addresses are unchanged (`0.0.0.0:8000` unless `--addr`/`--port`/`TYPECRATE_SERVICES_ADDR` says
+otherwise), and the extra listeners are **derived from the route table** through
+`server::declared_ports()` rather than configured: the bin binds exactly the ports the compiled-in
+groups declare, no more and no less.
 
 ## Routes are compiled in at build time
 
 There is **no runtime route registry**. `build.rs` scans the tree for `*-route.rs` files
 before the crate compiles, writes `$OUT_DIR/service_routes.rs`, and `src/lib.rs` includes
-it at crate scope; the generated `register_routes` chains every discovered route file into
-the `Router`, and the generated `route_metadata` concatenates the same modules'
-`ENDPOINTS` into the endpoint listing. A route that does not type-check is a normal
+it at crate scope; the generated `register_routes(router, port)` chains every discovered route
+file into the `Router` being built — the `port` argument is the listener that router serves, so
+each route file mounts only the groups that declare it — and the generated `route_metadata`
+concatenates the same modules' `ENDPOINTS` into the endpoint listing, unfiltered by port. A
+route that does not type-check is a normal
 `rustc` error pointing at that route file — or at the `*-core.rs` file holding its
 handler — never a failed import at request time.
 
@@ -662,7 +723,8 @@ the scanner finds it by name, the generated table names its module, and its sing
 `crate::service_routes!` block is the one place that produces **both** the mounted router
 and the `GET /v1/services/routes` row (see
 [Routes are compiled in at build time](#routes-are-compiled-in-at-build-time)). Everything
-that pairing needs is a verb, a path literal and a summary — a handful of lines — while
+that pairing needs is a path literal, the verbs that path answers with their handler names and
+one summary per verb, plus an optional `, port:` naming a listener — a handful of lines — while
 DTOs, storage helpers and handler bodies sit one `#[path]` away instead of bloating the
 file the build reads.
 
@@ -688,16 +750,20 @@ the route file carries the macro.
 2. Put the DTOs, the storage helpers and the handler fns in the core file as `pub` items,
    and put the `#[path = "<resource>-core.rs"] mod handlers;` plus the `use` lines in the
    route file.
-3. Declare every route once in the route file's single `crate::service_routes!` block:
-   verb, path literal, handler name, summary text, `;`. A summary belongs to that entry —
-   not to the file name and not to the path — so renaming a file never changes a listing
-   row.
+3. Declare every route once in the route file's single `crate::service_routes!` block, **path
+   first**: a path literal, `=>`, then a `{ ... }` group whose entries are
+   `VERB: handler, "summary";` — one per verb that path answers — closed by `;`. Add
+   `, port: N` between the closing brace and that `;` when the group belongs to a listener of
+   its own instead of the default one. A summary belongs to one verb entry — not to the file
+   name, not to the path and not to the group as a whole — so renaming a file never changes a
+   listing row. Two groups that share a path must summarise differently: the listing has no
+   other way to say which listener a row belongs to.
 4. Rebuild: see [Rebuild tracking](#rebuild-tracking-what-re-runs-the-scan-and-what-needs-a-re-scan)
    for what re-runs the scan. The new row then appears in `GET /v1/services/routes` and in
    the playground rail with nothing else touched.
 
 **What the split does not change is the wire surface.** The `*-route.rs` rename and the
-two-file layout are purely internal file organisation: the eighteen routes listed in
+two-file layout are purely internal file organisation: the nineteen listing rows documented in
 [Where the server answers](#where-the-server-answers), the listing endpoint itself, every
 method, path, status and summary, and every REST rule documented in
 [Endpoints as they behave on the wire](#endpoints-as-they-behave-on-the-wire) are identical
@@ -757,20 +823,33 @@ which is why two consecutive `cargo check` and `cargo build --release` invocatio
 both `Fresh` (0.4 s and 0.3 s after the first build).
 
 The route-file contract — one `crate::service_routes!` invocation, ordinary axum
-handlers, ordinary extractors. Both files of the `health` sample, in full for what the
-build cares about:
+handlers, ordinary extractors. **The grammar is path-first**: a path literal, then a
+method-keyed group of handlers, then an optional `, port:` naming the listener that group
+belongs to. That is the structure of the TypeScript route contract (`{ route, handler: asServiceHandler({ GET, POST }), port? }`,
+`packages/underload/service/src/server/{start.ts,handler.ts}`) restated in the notation this
+crate can type-check at compile time — the `{ ... }` group IS the `handler:` slot, its keys are
+the verbs, and `, port:` is the optional `port?` slot. Both files of the `health` sample, in
+full for what the build cares about:
 
 ```rust
 // examples/endpoints/health/health-route.rs — the lightweight half: nothing but the pull and the routes.
-//! GET /v1/services/health — the route this file mounts.
 #[path = "health-core.rs"]
 mod handlers;
 
 use handlers::health;
 
-// One entry per mounted (method, path) pair, each entry ending in `;`.
+// One group per mounted (path, listener) pair, each group ending in `;`; the verbs that path
+// answers live inside the group, one line each. No `, port:` means the DEFAULT listener.
 crate::service_routes! {
-    GET "/v1/services/health" => health, "Reports the service name and version";
+    "/v1/services/health" => {
+        GET: health, "Reports the service name and version";
+    };
+
+    // The same API path again, on a listener of its own. Neither group overrides the other:
+    // each one mounts into a different router.
+    "/v1/services/health" => {
+        GET: health, "Reports the service name and version on the isolated 8010 listener";
+    }, port: 8010;
 }
 ```
 
@@ -786,29 +865,70 @@ pub async fn health(State(_state): State<crate::server::AppState>) -> Json<Healt
 ```
 
 That macro (`src/server/metadata.rs`) is the whole contract, and it is what makes the
-listing honest: from one entry it emits **both** items the generated table refers to —
+listing honest: from one group it emits **both** items the generated table refers to —
 expanded **in the route module**, where the `use handlers::health;` line has already put
 the core file's fn in scope, so the emitted body needs no path of its own —
 
 ```rust
+// Abbreviated: the real expansion routes the verb through `__service_route_method_router!`
+// and the listener test through `__service_route_declared_port!`, which is what lets `ANY`
+// resolve to `axum::routing::any` while every other verb stays `MethodFilter::<VERB>`.
 pub fn register(
     router: axum::Router<crate::server::AppState>,
+    port: Option<u16>,
 ) -> axum::Router<crate::server::AppState> {
-    router.route("/v1/services/health", axum::routing::on(axum::routing::MethodFilter::GET, health))
+    // `port` is the listener being built: `None` is the default listener, `Some(N)` is the
+    // listener for N. One `.merge()` per written group, in the order written; a group whose
+    // declared port does not match merges an EMPTY router, so it contributes no path node at
+    // all and the path 404s on that listener instead of answering 405.
+    router
+        .merge(if port == None {
+            axum::Router::new()
+                .route("/v1/services/health", axum::routing::on(axum::routing::MethodFilter::GET, health))
+        } else {
+            axum::Router::new()
+        })
+        .merge(if port == Some(8010) {
+            axum::Router::new()
+                .route("/v1/services/health", axum::routing::on(axum::routing::MethodFilter::GET, health))
+        } else {
+            axum::Router::new()
+        })
 }
 
-pub const ENDPOINTS: &[crate::server::EndpointMeta] = &[crate::server::EndpointMeta {
-    method: "GET", // `stringify!` of the verb above, never a re-typed string
-    path: "/v1/services/health",
-    summary: "Reports the service name and version",
-}];
+// Every endpoint this file registers, on every listener, groups first and verbs second.
+pub const ENDPOINTS: &[crate::server::EndpointMeta] = &[
+    crate::server::EndpointMeta {
+        method: "GET", // `stringify!` of the verb above, never a re-typed string
+        path: "/v1/services/health",
+        summary: "Reports the service name and version",
+        port: None, // `Some(N)` for a group that wrote `, port: N`
+    },
+    crate::server::EndpointMeta {
+        method: "GET",
+        path: "/v1/services/health",
+        summary: "Reports the service name and version on the isolated 8010 listener",
+        port: Some(8010),
+    },
+];
 ```
 
 so a verb or a path cannot be renamed in one view and missed in the other: the method is
 `stringify!` of the very identifier handed to `MethodFilter` (an unknown verb is a
-compile error on the route file), and the path literal is the same token in
-`.route(..)` and in `EndpointMeta::path`. Nothing in `build_support/` reads a route
+compile error on the route file), the path literal is the same token in `.route(..)` and in
+`EndpointMeta::path`, and the `port` of a listing row is the very value `register` compares
+against. Nothing in `build_support/` reads a route
 file's *contents*, so the listing is not a parse of the source.
+
+**A port is a listener, never part of the URL.** The crate-scope `register_routes(router,
+port)` emitted by `build.rs` hands the listener it is building to every module's `register`,
+and `server::app_for(port, state)` is who asks for it: `app(state)` is `app_for(None, state)`
+— the default listener, every unported group, plus the four builtins — while
+`app_for(Some(N), state)` holds only that port's groups and no builtins. `src/bin/server.rs`
+binds one listener per distinct declared port (`server::declared_ports()`), in the same
+process. The endpoint listing is deliberately **not** filtered by port: `route_metadata()`
+answers one row per mounted `(method, path, port)`, which is how `GET /v1/services/routes`
+can show the same API path twice.
 
 **`ANY` is the one entry that does not name a `MethodFilter`.** axum 0.8 has no
 `MethodFilter::Any` constant — its verb-agnostic mount is the free function
@@ -830,11 +950,20 @@ order: the generated `route_metadata()` names `<module>::ENDPOINTS` for **every*
 discovered module, so a missing const is an ordinary rustc error pointing at the generated
 function rather than a listing that quietly omits an endpoint.
 
-An entry repeated with a *different* method is supported (axum merges the two
-`MethodRouter`s for that path, and the listing keeps one row per method); the same method
-*and* path twice is an axum panic while the router is being built, never a silent
-override. An empty invocation is legal too: `register` becomes the identity and
-`ENDPOINTS` the empty slice, which is what a placeholder route file compiles to.
+A path repeated with a *different* verb — a second verb inside the same group, or a whole group
+of its own — is supported (axum merges the two `MethodRouter`s for that path, and the listing
+keeps one row per `(method, path, port)`); the same method *and* path *and* port twice is an axum
+panic while the router is being built, never a silent override — a **deliberate divergence** from
+`@underload/service`, whose duplicate registration of the same route is last-write-wins. The
+reason is the listing: a Rust mount that quietly lost to a later one would also drop its row, so
+the published description would stop matching the socket, and a startup panic is cheaper to find
+than a listing that lies. The same method and path on
+**different** ports is not a duplicate at all: for a given listener only the matching group ever
+reaches `Router::route`, which is exactly what lets one API path be published on two ports at once
+(`tests/server_http.rs::the_same_api_path_is_served_on_both_listeners_at_the_same_time`). A group
+with no verbs contributes no mount and no row, and an empty invocation is legal too: `register`
+becomes the identity and `ENDPOINTS` the empty slice, which is what a placeholder route file
+compiles to.
 
 Each discovered **route file** becomes `#[path = "<absolute path>"] mod <identifier>;`,
 where `<identifier>` is the scan-root-relative path with every non-`[A-Za-z0-9_]`
@@ -881,19 +1010,28 @@ with `cargo generate-lockfile`.
 
 This milestone is the framework, not the migration:
 
-- **No TypeScript endpoint has been ported** except one. The fifteen `GET`/`POST`-style
-  documented routes are the package's own samples (`examples/endpoints/**`), and the two REST
+- **No TypeScript endpoint has been ported** except one. The `GET`/`POST`-style documented
+  routes — nineteen listing rows: three `ANY` rows of the harness bridge, fifteen sample routes,
+  and the second `health` row that declares port `8010` — are the package's own samples
+  (`examples/endpoints/**`), and the two REST
   samples are toy CRUD written to demonstrate the framework, not a port of anything. The
   `@underload/service` catalogue (comfy, database, preferences, …) still runs on the TS gateway,
   which stays untouched. `harness` is the exception: its Rust port lives in
   `packages/typecrate/harness` and reaches the wire through the discovered bridge described in
   [Harness gateway](#harness-gateway-v1harness) — the gateway serves `/v1/harness`, the TS harness
   package is still its own host.
-- **Single port, single origin.** No multi-port gateway, no static-file mount or web
-  root (the playground page at `/` is embedded in the binary, not read from disk), and no
-  media/range serving. The one streaming surface is the `harness.v1` WebSocket mount
-  (`axum`'s `ws` feature is enabled for it); there is no SSE and no chunked handler of this
-  package's own.
+- **Several listeners, one process, no redirect.** A route group may name its own listener with
+  the trailing `, port:` slot, and the bin binds one listener per distinct declared port beside
+  its default one (`server::declared_ports()` → `server::app_for`), each serving only the groups
+  that declared it. So the same API path can legitimately be served twice — once by the default
+  listener, once by a declared one — with neither declaration overriding the other. What is still
+  **not** here is the TS gateway's `307` redirect tier and its per-group process forking: every
+  listener is in this one process, nothing forwards or redirects, and the client picks the port.
+  Each listener is its own origin, and only the default one mounts the four builtins. There is
+  still no static-file mount or web root (the playground page at `/` is embedded in the binary,
+  not read from disk) and no media/range serving. The one streaming surface is the `harness.v1`
+  WebSocket mount (`axum`'s `ws` feature is enabled for it); there is no SSE and no chunked
+  handler of this package's own.
 - **No security middleware yet**: no bearer/API-key auth, no Origin **gate** (the request's
   `Origin` is never validated, and no endpoint is refused because of it), no rate limiting. The
   transport does publish the TS host's permissive CORS answer on every response —

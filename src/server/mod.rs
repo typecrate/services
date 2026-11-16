@@ -6,9 +6,18 @@
 //!   axum's `State` extractor. It is cheap to clone (axum requires `Clone` on the
 //!   state type) and it is the ONLY place the process learns where writable data
 //!   goes - handlers get the root, they never re-derive it from `cwd`.
-//! * [`app`] hands that state to the build-time generated route table
-//!   (`crate::register_routes`, see `src/lib.rs`), so the router a test builds and
-//!   the router the executable serves are literally the same function.
+//! * [`app_for`] hands that state to the build-time generated route table
+//!   (`crate::register_routes`, see `src/lib.rs`) FOR ONE LISTENER - the `port` it is
+//!   given is the port the route files may declare with their optional `, port:`
+//!   trailer (`src/server/metadata.rs`) - so the router a test builds and the router
+//!   the executable serves are literally the same function. [`app`] is that factory
+//!   for the default listener (`port == None`) and keeps its pre-port signature.
+//! * [`declared_ports`] answers "which extra listeners exist at all": the distinct
+//!   ports the discovered route table declares. It lives here, next to the router
+//!   factory, because the route table is the only source of that answer - the
+//!   executable binds exactly this set (`src/bin/server.rs`) rather than configuring
+//!   one, so a port cannot be served by a listener that does not know about it or the
+//!   other way round.
 //! * The browser surface also lives here: the embedded playground document plus the
 //!   `GET /v1/services/routes` listing ([`EndpointMeta`]). Both are additive and
 //!   both stay in this file, because the router factory is the only thing that
@@ -308,9 +317,13 @@ async fn route_metadata_listing() -> Response {
 // cross-origin playground on another device can talk to this server at all.
 //
 // What is deliberately NOT copied from TS: the `307` worker-redirect tier. That tier exists
-// because the TS gateway forks one worker process per endpoint group; this router serves
-// everything in-process, so there is nothing to redirect to and no second listener to keep in
-// sync (the bind defaults are unchanged by T6).
+// because the TS gateway forks one worker process per endpoint group and answers the gateway's own
+// request with a redirect to the worker's port. Here every listener is IN-PROCESS and each one is
+// a whole `Router` of its own (`app_for`), so a request is never handed between listeners: a group
+// that declares a port is simply mounted on that port's router and is a plain 404 from the
+// fallback everywhere else. Process forking is out of scope for the same reason - the extra
+// listeners `src/bin/server.rs` binds are tasks inside this one process, not worker processes, and
+// nothing in this layer redirects.
 //
 // Why the preflight test needs `Access-Control-Request-Method`: that header is what makes an
 // `OPTIONS` a *preflight* rather than an `OPTIONS` request. Hono's `cors()` short-circuits on the
@@ -392,48 +405,130 @@ async fn gateway(request: Request, next: Next) -> Response {
     with_gateway_headers(next.run(request).await)
 }
 
-/// The whole HTTP surface: generated routes + the shared body cap + the gateway header and
-/// preflight layer, frozen with `state`.
+/// The whole HTTP surface of ONE listener: generated routes + the shared body cap +
+/// the gateway header and preflight layer, frozen with `state`.
 ///
-/// `crate::register_routes` is emitted by `build.rs` into
-/// `$OUT_DIR/service_routes.rs` and included at crate scope by `src/lib.rs`; each
-/// discovered route file contributes its own `register(router)` call, so this
-/// function never needs to know which endpoints exist.
+/// `port` selects WHICH listener is being built and is the same value the route files
+/// declare with their optional `, port:` trailer (see
+/// `src/server/metadata.rs` "What `port` means"): `None` is the default listener,
+/// `Some(N)` is the listener for port N. Only the groups whose declared port equals
+/// `port` are mounted, which is what makes the user-facing rule true: one API path may
+/// be declared twice, once per port, and the two declarations never override each
+/// other because they land in two different `Router` values. The group for the *other*
+/// port contributes no `.route()` call at all, so a path that is not served here does
+/// not exist here (the fallback's plain `404`, never a router `405`).
 ///
-/// Layer order is load-bearing: `.layer` only affects routes registered *before*
-/// it, so the body limit is applied after `register_routes` (covering every
-/// generated route) and `.with_state` comes last of the state-bearing chain to
-/// erase `AppState` from the router type, which is what lets `app()` return the
-/// plain `axum::Router` the bin and the tests both serve. The gateway layer rides
-/// on the OUTSIDE of all of it, so no route - generated, builtin or a future
-/// fallback - can escape the cross-origin header set.
+/// `crate::register_routes` is emitted by `build.rs` into `$OUT_DIR/service_routes.rs`
+/// and included at crate scope by `src/lib.rs`; each discovered route file contributes
+/// its own `register(router, port)` call, which filters its groups by that `port`, so
+/// this function never needs to know which endpoints exist or on which ports.
 ///
-/// The builtin browser surface is registered in the same position on purpose: the
-/// four routes above are added before `.layer(DefaultBodyLimit::max(..))`, so the
-/// one body cap covers them too and there is no route outside the limit.
+/// **The builtin browser surface is mounted on the default listener only** (`port ==
+/// None`), and that is a decision rather than an omission: the playground document
+/// navigates exclusively through `GET /v1/services/routes`, while the listing answers
+/// with every row of the table - rows that on an extra listener mostly belong to a
+/// different port. An extra listener exists to serve exactly the API paths that asked
+/// for it, so it carries neither the page nor the listing: `/`, `/playground.css`,
+/// `/playground.js` and `/v1/services/routes` are plain 404s there. `app` (the default
+/// listener) keeps all four.
 ///
-/// Nothing here shadows a discovered route silently. The four paths are reserved,
-/// and a route file that registers one of them with `GET` hits axum's duplicate
-/// path check while the router is being built (`PathRouter::route` -> `set_node`
-/// -> matchit insert, surfaced by `panic_on_err!`, axum-0.8.9
-/// `src/routing/{mod.rs:48-55,path_router.rs:141-159}`), i.e. `app()` panics at
-/// startup instead of quietly losing an endpoint.
+/// Layer order is load-bearing and is identical for every listener: `.layer` only
+/// affects routes registered *before* it, so the body limit is applied after
+/// `register_routes` (covering every generated route on this listener) and
+/// `.with_state` comes last of the state-bearing chain to erase `AppState` from the
+/// router type, which is what lets `app_for` return the plain `axum::Router` the bin
+/// and the tests both serve. The gateway layer rides on the OUTSIDE of all of it, so
+/// no route - generated, builtin or a future fallback - can escape the cross-origin
+/// header set, on the default listener or on a declared one.
+///
+/// The builtin browser surface is registered in the same position on purpose: the four
+/// routes above are added before `.layer(DefaultBodyLimit::max(..))`, so the one body
+/// cap covers them too and there is no route outside the limit.
+///
+/// Nothing here shadows a discovered route silently. The four paths are reserved, and
+/// a route file that registers one of them with `GET` on the DEFAULT listener hits
+/// axum's duplicate path check while the router is being built (`PathRouter::route` ->
+/// `set_node` -> matchit insert, surfaced by `panic_on_err!`, axum-0.8.9
+/// `src/routing/{mod.rs:48-55,path_router.rs:141-159}`), i.e. `app_for` panics at
+/// startup instead of quietly losing an endpoint. A group that declares its own port
+/// lands in a router where the builtins are not mounted at all, so it cannot clash
+/// with them - and cannot use those four paths for a tool the playground does not
+/// serve.
 ///
 /// No `#[must_use]` here: axum already marks `Router` itself `#[must_use]`
 /// (axum-0.8.9 `src/routing/router.rs`), and repeating it is
 /// `clippy::double_must_use`, which `npm run lint:strict` denies.
-pub fn app(state: AppState) -> Router {
-    crate::register_routes(Router::new())
-        .route(ROUTE_METADATA_PATH, get(route_metadata_listing))
-        .route(PLAYGROUND_PATH, get(playground_page))
-        .route(PLAYGROUND_STYLES_PATH, get(playground_stylesheet))
-        .route(PLAYGROUND_SCRIPT_PATH, get(playground_script))
+pub fn app_for(port: Option<u16>, state: AppState) -> Router {
+    // The generated chain is the ONLY source of API routes, and it filters per group
+    // against the listener being built (`src/server/metadata.rs`), so an extra-port
+    // router here holds just the groups that declared it.
+    let router = crate::register_routes(Router::new(), port);
+
+    // Builtins on the default listener only - see the "builtin browser surface"
+    // paragraph above. `else` keeps the chain untouched, so an extra-port router is
+    // exactly the generated table plus the shared layers.
+    let router = if port.is_none() {
+        router
+            .route(ROUTE_METADATA_PATH, get(route_metadata_listing))
+            .route(PLAYGROUND_PATH, get(playground_page))
+            .route(PLAYGROUND_STYLES_PATH, get(playground_stylesheet))
+            .route(PLAYGROUND_SCRIPT_PATH, get(playground_script))
+    } else {
+        router
+    };
+
+    router
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
         // Outermost, so a preflight is answered before the router is consulted AND
         // every response - including a `101` upgrade and a bare 404 - carries the
         // same four headers.
         .layer(middleware::from_fn(gateway))
+}
+
+/// The whole HTTP surface of the DEFAULT listener - literally [`app_for(None, state)`].
+///
+/// The signature is unchanged from before route files could declare ports, and so is
+/// everything it builds: the unported groups (the ones written without `, port:`), the
+/// four builtins, the body cap, the state and the gateway layer, in the same order.
+/// That is what keeps the README's claim true - a test that serves `app(state)` and the
+/// executable's default listener run the same router - while the extra listeners the bin
+/// binds are `app_for(Some(port), state)` beside it.
+pub fn app(state: AppState) -> Router {
+    app_for(None, state)
+}
+
+/// Every port the discovered route table declares with a `, port:` trailer, sorted and
+/// de-duplicated - i.e. the set of EXTRA listeners a process has to bind next to its
+/// default one.
+///
+/// This is derived, never configured: the route table is the only thing that knows
+/// which ports are in use, so `src/bin/server.rs` binds exactly this set and cannot
+/// drift from it (a declared port with no listener would 404 forever, and a listener
+/// with no declared routes would serve an empty router). The default listener is NOT
+/// part of the answer - its port is the caller's business (`--addr`/`--port`/env in the
+/// bin, `0.0.0.0:8000` there) - which is also why the value is `Option<u16>`-shaped
+/// metadata rather than a `u16` here.
+///
+/// A build whose route files declare no port answers with an empty `Vec`, which is the
+/// case the bin uses to stay on its single listener.
+#[must_use]
+pub fn declared_ports() -> Vec<u16> {
+    ports_from_metadata(&crate::route_metadata())
+}
+
+/// The pure half of [`declared_ports`]: the distinct `Some(port)` values of `routes`,
+/// sorted and de-duplicated. Private so the public surface stays one function, while
+/// the rules (duplicates collapse, order is ascending, an all-`None` table and an empty
+/// table both stay empty) are still unit-testable without the discovered tree.
+#[must_use]
+fn ports_from_metadata(routes: &[EndpointMeta]) -> Vec<u16> {
+    let mut ports: Vec<u16> = routes.iter().filter_map(|route| route.port).collect();
+    // `sort_unstable` + `dedup` instead of a `BTreeSet`: the row count is tiny, this is
+    // called at startup (not per request), and the result is a plain `Vec` either way.
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 #[cfg(test)]
@@ -595,5 +690,342 @@ mod tests {
             "a duplicated CORS header is a browser-level rejection"
         );
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // -------------------------------------------------------------------
+    // The port-aware router factory (T7).
+    //
+    // These go over a real TCP socket, the way `tests/server_http.rs` does: every
+    // question below is a DISPATCH question ("does the router built for 8010 really
+    // serve /v1/services/health while the default router keeps serving it?"), and
+    // this crate has no in-process dispatch path - `tower` is not one of its
+    // dependencies, so `Router::oneshot` is not even nameable here.
+    // -------------------------------------------------------------------
+
+    /// `GET /v1/services/health`'s body, fixed by the endpoint contract
+    /// (`examples/endpoints/health/health-core.rs` fills exactly these two fields from
+    /// Cargo metadata, and `tests/server_http.rs` pins the same bytes).
+    const HEALTH_BODY: &str = r#"{"service":"typecrate-services","version":"1.0.2"}"#;
+
+    /// The one API path the tree declares TWICE, once per listener
+    /// (`examples/endpoints/health/health-route.rs`) - the pair this feature exists for.
+    const SHARED_PATH: &str = "/v1/services/health";
+
+    /// The one port the tree declares, and a port NOTHING declares. 8011 appears in a
+    /// `service_routes!` probe inside `src/server/metadata.rs`'s own tests, which is not
+    /// part of the discovered table, so `declared_ports()` cannot report it.
+    const DECLARED_PORT: u16 = 8010;
+    const AN_UNDECLARED_PORT: u16 = 8011;
+
+    /// A data root that never has to exist: every request dialed below is a read, and the
+    /// path lives under the repo `Temp/` scratch area (AGENTS.md) rather than the shared
+    /// `temporary/dump` boundary.
+    fn scratch_state() -> AppState {
+        AppState::new(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../Temp/opencode/server-ports"),
+        )
+    }
+
+    /// Serves `router` on an ephemeral loopback listener, returning its base URL plus the
+    /// task handle, so one test can hold two listeners at the same time.
+    async fn serve_ephemeral(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback listener binds");
+        let address = listener
+            .local_addr()
+            .expect("a bound listener reports its address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("the ephemeral listener serves to completion");
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    /// A client that never parks an idle connection: `axum::serve` finishes one connection
+    /// before accepting the next, so a keep-alive connection sitting in the pool in front of
+    /// the accept loop would serialise - or stall - the rest of a test.
+    fn http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .build()
+            .expect("a client with no idle pool builds")
+    }
+
+    /// `GET <base><path>` -> the status code, the observable half of every port assertion.
+    async fn get_status(client: &reqwest::Client, base: &str, path: &str) -> StatusCode {
+        client
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("GET {base}{path} reaches the listener: {err}"))
+            .status()
+    }
+
+    /// The pure half of the port derivation, on synthetic rows: an empty table and an
+    /// all-`None` table both answer "no extra listener", and declared ports come back
+    /// ascending and once each whatever the listing order is (the bin binds in this order,
+    /// and two groups sharing one port must bind ONE listener).
+    #[test]
+    fn the_port_helper_sorts_dedupes_and_stays_empty_without_a_declaration() {
+        let row = |port: Option<u16>| EndpointMeta {
+            method: "GET",
+            path: "/probe",
+            summary: "A probe row",
+            port,
+        };
+        let none: Vec<u16> = Vec::new();
+        assert_eq!(ports_from_metadata(&[]), none);
+        assert_eq!(ports_from_metadata(&[row(None), row(None)]), none);
+        assert_eq!(
+            ports_from_metadata(&[
+                row(Some(9000)),
+                row(None),
+                row(Some(8010)),
+                row(Some(9000)),
+                row(Some(8010)),
+            ]),
+            vec![8010, 9000]
+        );
+    }
+
+    /// AC3: `declared_ports()` is derived from the generated listing, not configured - the
+    /// exact answer for this tree today, plus the two invariants that make it safe to bind
+    /// from: every ported row's port is in it, and the default listener is not.
+    #[test]
+    fn declared_ports_is_exactly_the_set_of_ports_the_route_tree_declares() {
+        // Today's tree declares exactly one port: the `port: 8010` group of
+        // `examples/endpoints/health/health-route.rs`. Adding or removing a `, port:`
+        // group is therefore an explicit edit here, not a silent drift.
+        assert_eq!(declared_ports(), vec![DECLARED_PORT]);
+        // Derived, and from the same table `GET /v1/services/routes` serialises.
+        let rows = crate::route_metadata();
+        assert_eq!(declared_ports(), ports_from_metadata(&rows));
+        // Exactly one row declares it; every other row belongs to the default listener,
+        // so nothing is served on a listener `declared_ports()` did not report.
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.port == Some(DECLARED_PORT))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.port.is_none()).count(),
+            rows.len() - 1
+        );
+    }
+
+    /// AC1: one API path declared on two ports is served by two INDEPENDENT listeners.
+    /// Neither declaration overrides the other, and a third listener for a port nobody
+    /// declares does not serve the path at all.
+    #[tokio::test]
+    async fn the_same_api_path_declared_on_two_ports_is_served_on_both_listeners() {
+        let state = scratch_state();
+        let default = serve_ephemeral(app_for(None, state.clone())).await;
+        let lan = serve_ephemeral(app_for(Some(DECLARED_PORT), state.clone())).await;
+        let undeclared = serve_ephemeral(app_for(Some(AN_UNDECLARED_PORT), state)).await;
+        let client = http_client();
+
+        // The shared path answers on BOTH listeners with the same contract body: two
+        // separate `Router` values, each mounted with its own group.
+        for base in [&default.0, &lan.0] {
+            let response = client
+                .get(format!("{base}{SHARED_PATH}"))
+                .send()
+                .await
+                .unwrap_or_else(|err| panic!("GET {base}{SHARED_PATH} is served: {err}"));
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{base} serves {SHARED_PATH}"
+            );
+            assert_eq!(response.text().await.expect("a body"), HEALTH_BODY);
+        }
+
+        // A port no route file declares is an empty API surface (see the next test for
+        // the 404-not-405 detail), so the two real listeners above are not one router.
+        assert_eq!(
+            get_status(&client, &undeclared.0, SHARED_PATH).await,
+            StatusCode::NOT_FOUND
+        );
+        // And they are distinguishable in the other direction too: the playground is the
+        // default listener's, so the declared listener never answers for it.
+        assert_eq!(
+            get_status(&client, &default.0, PLAYGROUND_PATH).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_status(&client, &lan.0, PLAYGROUND_PATH).await,
+            StatusCode::NOT_FOUND
+        );
+
+        for handle in [default.1, lan.1, undeclared.1] {
+            handle.abort();
+        }
+    }
+
+    /// What an extra router that matches nothing looks like, and why the answer is the
+    /// fallback's `404` with no `allow` header: a group whose port does not match
+    /// contributes no `.route()` call at all, so the path simply does not exist there
+    /// (`src/server/metadata.rs` "What `port` means"), and the builtins are never mounted
+    /// on an extra listener at all.
+    #[tokio::test]
+    async fn a_router_for_a_port_nobody_declares_serves_nothing_but_the_layers() {
+        let (base, handle) =
+            serve_ephemeral(app_for(Some(AN_UNDECLARED_PORT), scratch_state())).await;
+        let client = http_client();
+
+        let response = client
+            .get(format!("{base}{SHARED_PATH}"))
+            .send()
+            .await
+            .expect("the listener answers");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !response.headers().contains_key(header::ALLOW),
+            "a path that is not mounted here is a 404, never a router 405 with a verb list"
+        );
+
+        for path in [
+            PLAYGROUND_PATH,
+            PLAYGROUND_STYLES_PATH,
+            PLAYGROUND_SCRIPT_PATH,
+            ROUTE_METADATA_PATH,
+        ] {
+            assert_eq!(
+                get_status(&client, &base, path).await,
+                StatusCode::NOT_FOUND,
+                "{path} belongs to the default listener only"
+            );
+        }
+
+        handle.abort();
+    }
+
+    /// AC2: `app(state)` is `app_for(None, state)` - every generated GET behaves
+    /// identically through both factories, and the four builtins are still there.
+    #[tokio::test]
+    async fn app_is_the_default_listener_router_for_every_route_and_the_four_builtins() {
+        let state = scratch_state();
+        let factory = serve_ephemeral(app(state.clone())).await;
+        let same = serve_ephemeral(app_for(None, state)).await;
+        let client = http_client();
+
+        // Every GET the generated table lists, dialed through both routers. Only GETs are
+        // dialed: the write samples would mutate the store between the two calls and
+        // compare a create against a second create.
+        let rows = crate::route_metadata();
+        let mut dialed: Vec<&str> = Vec::new();
+        for row in rows.iter().filter(|row| row.method == "GET") {
+            let through_app = get_status(&client, &factory.0, row.path).await;
+            let through_app_for = get_status(&client, &same.0, row.path).await;
+            assert_eq!(
+                through_app, through_app_for,
+                "GET {} must not depend on which factory built the default router",
+                row.path
+            );
+            dialed.push(row.path);
+        }
+        // The loop actually ran over the table (a listing that stopped containing the
+        // shared path would make every assertion above vacuous).
+        assert!(
+            dialed.contains(&SHARED_PATH),
+            "the listing must contain {SHARED_PATH}"
+        );
+        assert_eq!(
+            dialed.len(),
+            rows.iter().filter(|row| row.method == "GET").count()
+        );
+
+        // The four framework builtins, unchanged by the port work.
+        for path in [
+            PLAYGROUND_PATH,
+            PLAYGROUND_STYLES_PATH,
+            PLAYGROUND_SCRIPT_PATH,
+            ROUTE_METADATA_PATH,
+        ] {
+            assert_eq!(
+                get_status(&client, &factory.0, path).await,
+                StatusCode::OK,
+                "{path} is still served on the default listener"
+            );
+        }
+
+        // The listing on the default listener is the generated metadata verbatim, and it
+        // carries exactly one row with a `port` key - the playground's only hint about
+        // which listener a row belongs to.
+        let response = client
+            .get(format!("{}{ROUTE_METADATA_PATH}", factory.0))
+            .send()
+            .await
+            .expect("the listing is served");
+        assert_eq!(response.status(), StatusCode::OK);
+        let listing: serde_json::Value = response.json().await.expect("the listing is JSON");
+        assert_eq!(
+            listing,
+            serde_json::to_value(rows).expect("endpoint metadata is serialisable")
+        );
+        assert_eq!(
+            listing
+                .as_array()
+                .expect("a JSON array")
+                .iter()
+                .filter(|row| row.get("port") == Some(&serde_json::json!(DECLARED_PORT)))
+                .count(),
+            1,
+            "one declared listener, one `port` key"
+        );
+
+        for handle in [factory.1, same.1] {
+            handle.abort();
+        }
+    }
+
+    /// The gateway layer is outside EVERY listener, declared or not: the four cross-origin
+    /// headers ride on a 200 from an extra port, and a preflight is still answered before
+    /// routing there.
+    #[tokio::test]
+    async fn an_extra_listener_still_answers_through_the_gateway_layer() {
+        let (base, handle) = serve_ephemeral(app_for(Some(DECLARED_PORT), scratch_state())).await;
+        let client = http_client();
+
+        let response = client
+            .get(format!("{base}{SHARED_PATH}"))
+            .send()
+            .await
+            .expect("the extra listener answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        for name in [
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+        ] {
+            assert_eq!(
+                response
+                    .headers()
+                    .get(&name)
+                    .and_then(|value| value.to_str().ok()),
+                Some(GATEWAY_ALLOW_ALL),
+                "{name} is the transport's on every listener"
+            );
+        }
+        assert_eq!(
+            response
+                .headers()
+                .get(PRIVATE_NETWORK_ALLOW_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, format!("{base}{SHARED_PATH}"))
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .send()
+            .await
+            .expect("the extra listener answers a preflight");
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+
+        handle.abort();
     }
 }

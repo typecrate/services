@@ -1,8 +1,10 @@
 //! The `/v1/harness` mount, proven THROUGH the services gateway (T6).
 //!
 //! Every request here goes over a real TCP socket to a real `axum::serve` of
-//! `typecrate_services::server::app(state)` - the exact router `src/bin/server.rs` serves - so
-//! what is under test is the BRIDGE, not a re-run of the harness's own suite:
+//! `typecrate_services::server::app(state)` - the router `src/bin/server.rs` serves on its DEFAULT
+//! listener, and the one router the bridge can appear on, because the harness route file declares
+//! no `, port:` trailer - so what is under test is the BRIDGE, not a re-run of the harness's own
+//! suite:
 //!
 //!   * the discovered route module (`packages/typecrate/harness/endpoint/harness/harness-route.rs`)
 //!     is mounted on the gateway's `/v1/harness` prefix and hands the request to
@@ -105,7 +107,10 @@ const STREAM_UPGRADE_SENTENCE: &str = "GET /stream expects a WebSocket upgrade (
 /// path `packages/typecrate/harness/endpoint/harness/harness-route.rs` sorts before every
 /// `packages/typecrate/services/examples/...` route file, so these three are the FIRST rows of
 /// `GET /v1/services/routes`. Pinned here as (method, path, summary) - `tests/server_http.rs` pins
-/// the same triples inside the whole table.
+/// the same triples inside the whole table (nineteen rows there, because the `health` sample also
+/// declares itself on port 8010). The bridge itself declares no `, port:` trailer, so all three
+/// rows belong to the default listener - asserted below, because that is what keeps `app()` the
+/// complete harness surface.
 const HARNESS_ROWS: [(&str, &str, &str); 3] = [
     ("ANY", "/v1/harness", "Underload harness service document"),
     (
@@ -794,10 +799,8 @@ async fn the_listing_reports_the_three_harness_rows_first_and_as_any() {
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
 
     // (method, path, summary) per row, in the listing's own order.
-    let rows: Vec<(&str, &str, &str)> = reply
-        .body
-        .as_array()
-        .expect("the listing is an array")
+    let listed_rows = reply.body.as_array().expect("the listing is an array");
+    let rows: Vec<(&str, &str, &str)> = listed_rows
         .iter()
         .map(|row| {
             (
@@ -818,6 +821,19 @@ async fn the_listing_reports_the_three_harness_rows_first_and_as_any() {
         3,
         "the bridge registers exactly three paths: {rows:?}"
     );
+    // And the bridge declares no `, port:` trailer, so its rows are the first THREE rows of the
+    // listing and none of them carries a `port` key: the whole harness surface belongs to the
+    // DEFAULT listener, i.e. to the `app()` router this file serves. The one ported row this build
+    // compiles in (the `health` sample on 8010) is therefore NOT one of the bridge's paths, and
+    // the extra listener holds no harness route at all - pinned over a socket by
+    // `tests/server_http.rs::a_port_listener_serves_only_the_groups_that_declare_it`, which asserts
+    // that listener 404s `/v1/harness` without an `allow` header.
+    for row in listed_rows.iter().take(HARNESS_ROWS.len()) {
+        assert!(
+            row.get("port").is_none(),
+            "a harness row declares a listener, which the bridge never does: {row}"
+        );
+    }
     // No builtin path is claimed by the bridge, and no bridge path is claimed twice.
     for (_, path, _) in &rows[..HARNESS_ROWS.len()] {
         assert!(

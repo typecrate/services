@@ -3,7 +3,7 @@
 //     vite-node scripts/check-playground.ts                    # hermetic: the real
 //                                                              # assets, transport = the
 //                                                              # fixtures below
-//     vite-node scripts/check-playground.ts --base http://127.0.0.1:5001
+//     vite-node scripts/check-playground.ts --base http://127.0.0.1:8000
 //                                                              # the same flow against a
 //                                                              # running server
 //
@@ -57,7 +57,7 @@ if (args.includes('--help') || args.includes('-h')) {
 const baseIndex = args.indexOf('--base');
 const BASE = baseIndex === -1 ? null : args[baseIndex + 1];
 if (baseIndex !== -1 && !BASE) {
-    console.log('--base needs an origin, e.g. --base http://127.0.0.1:5001');
+    console.log('--base needs an origin, e.g. --base http://127.0.0.1:8000');
     process.exit(2);
 }
 if (BASE && !/^https?:\/\/[^/]+\/?$/.test(BASE)) {
@@ -79,7 +79,7 @@ const { JSDOM, VirtualConsole } = jsdomModule;
 
 // ------------------------------------------------------------------------ fixtures
 
-/// The eighteen endpoints the compiled server lists, exactly as `GET /v1/services/routes`
+/// The nineteen endpoints the compiled server lists, exactly as `GET /v1/services/routes`
 /// serialises them (`EndpointMeta` field order is JSON key order, `src/server/metadata.rs`).
 ///
 /// The three `/v1/harness` rows come FIRST: the bridge's route file lives in the harness
@@ -98,6 +98,13 @@ const LISTING_JSON =
     '{"method":"POST","path":"/v1/services/echo","summary":"Echoes the posted `value` unchanged"},' +
     '{"method":"GET","path":"/v1/services/echo/{value}","summary":"Echoes `{value}`, with `?prefix=` applied"},' +
     '{"method":"GET","path":"/v1/services/health","summary":"Reports the service name and version"},' +
+    // The same API path declared a second time with `, port: 8010` in
+    // `examples/endpoints/health/health-route.rs`. `port` is the row's last key and appears ONLY on
+    // this row (`EndpointMeta`'s last field, `skip_serializing_if`), so the row above keeps three
+    // keys. The playground parser reads this key too (`src/server/playground.js`): it renders it as
+    // the row's listener marker, names it in the accessible name, and keys selection on the row's
+    // listing index, so the two rows are separately selectable.
+    '{"method":"GET","path":"/v1/services/health","summary":"Reports the service name and version on the isolated 8010 listener","port":8010},' +
     '{"method":"GET","path":"/v1/services/locations","summary":"Lists every stored location, `?city=` narrows by exact city"},' +
     '{"method":"POST","path":"/v1/services/locations","summary":"Creates a location and answers 201 with it"},' +
     '{"method":"GET","path":"/v1/services/locations/{id}","summary":"Returns one location by id, or 404 when the id is unknown"},' +
@@ -336,7 +343,7 @@ async function statusLabel(status: number, method: string, url: string, init: Re
 }
 
 const dom = new JSDOM(assets.served['/'], {
-    url: BASE || 'http://127.0.0.1:5001/',
+    url: BASE || 'http://127.0.0.1:8000/',
     contentType: 'text/html',
     runScripts: 'outside-only',
     pretendToBeVisual: true,
@@ -357,6 +364,19 @@ const rowFor = (ariaLabel: string) =>
 const paramInput = () => doc.querySelector('#path-param-rows .param-row input');
 const firstRowKey = (container: string) => doc.querySelector(`${container} .kv-row .kv-key`);
 const firstRowValue = (container: string) => doc.querySelector(`${container} .kv-row .kv-value`);
+/**
+ * The accessible names of every row the rail marks current, joined. Joining makes the assertion
+ * exact in two directions at once: the right row is marked, and NO other row is.
+ */
+const currentRowLabels = () =>
+    [...doc.querySelectorAll('#endpoint-list [aria-current]')]
+        .map((button) => button.getAttribute('aria-label'))
+        .join('\n');
+/** The visible listener marker of a rail row, or an explicit sentinel when it has none. */
+const markerText = (row: any) => {
+    const node = row.querySelector('.endpoint-port');
+    return node === null ? 'no listener marker' : node.textContent;
+};
 
 /** Polls the DOM until `predicate` is truthy (fixed 25 ms steps, bounded). */
 async function waitFor(label: string, predicate: () => any, limit = 200) {
@@ -378,7 +398,7 @@ const LABEL_422 = await statusLabel(422, 'POST', '/v1/services/echo', {
 const LABEL_415 = await statusLabel(415, 'POST', '/v1/services/echo', { headers: {} });
 
 // --- 1. the listing drives the rail: rows, order, count, and one automatic request --
-await waitFor('endpoint list', () => doc.querySelectorAll('#endpoint-list button').length === 18);
+await waitFor('endpoint list', () => doc.querySelectorAll('#endpoint-list button').length === 19);
 check(
     'endpoint rows',
     [...doc.querySelectorAll('#endpoint-list button')]
@@ -397,6 +417,10 @@ check(
         'POST|/v1/services/echo|Echoes the posted `value` unchanged',
         'GET|/v1/services/echo/{value}|Echoes `{value}`, with `?prefix=` applied',
         'GET|/v1/services/health|Reports the service name and version',
+        // Same badge, same path, different summary: this is the `, port: 8010` declaration. The pin
+        // reads only the three text nodes, which is itself the evidence that the listener marker is a
+        // SEPARATE node (`7b` pins its text) and never a rewrite of the path the row requests.
+        'GET|/v1/services/health|Reports the service name and version on the isolated 8010 listener',
         'GET|/v1/services/locations|Lists every stored location, `?city=` narrows by exact city',
         'POST|/v1/services/locations|Creates a location and answers 201 with it',
         'GET|/v1/services/locations/{id}|Returns one location by id, or 404 when the id is unknown',
@@ -411,7 +435,7 @@ check(
         'DELETE|/v1/services/pets/{id}|Removes one pet by id and answers 204, or 404 when the id is unknown',
     ].join('\n'),
 );
-check('endpoint count', text('endpoint-count'), '18 endpoints');
+check('endpoint count', text('endpoint-count'), '19 endpoints');
 check('endpoint rail state is quiet', text('endpoint-state'), '');
 check('the method becomes a data attribute, never a style', doc.querySelector('#endpoint-list .badge').getAttribute('data-method'), 'any');
 check('listing request url', requests[0].url, '/v1/services/routes');
@@ -511,12 +535,15 @@ check('invalid input sent no request', requests.length, beforeEmptyParam);
 check('the previous response is kept while input is invalid', text('response-body'), '{\n  "value": "pre-<img src=x onerror=alert(1)>"\n}');
 
 // --- 7. search filters the rail without disturbing the composer -------------------
-// `health` is the one term that still matches a single row now that the rail lists the
-// two REST sample trees as well (its summaries say `pet`/`location`, never `health`).
+// `health` now matches TWO rows, not one: the same API path is declared twice in
+// `examples/endpoints/health/health-route.rs`, once for the default listener and once with
+// `, port: 8010`, and the filter haystack is `method + path + summary`, so both paths hit the term
+// (neither summary mentions "health"). Matching two is the point of this filter assertion: a rail
+// that de-duplicated the pair, or a listing that lost the ported row, would report one here.
 element('endpoint-search').value = 'health';
 element('endpoint-search').dispatchEvent(new window.Event('input', { bubbles: true }));
-await waitFor('filtered rail', () => doc.querySelectorAll('#endpoint-list button').length === 1);
-check('filtered count', text('endpoint-count'), '1 match of 18');
+await waitFor('filtered rail', () => doc.querySelectorAll('#endpoint-list button').length === 2);
+check('filtered count', text('endpoint-count'), '2 matches of 19');
 check('a filter that matches leaves the state line empty', text('endpoint-state'), '');
 check('the composer keeps its selection', text('composer-target'), 'GET /v1/services/echo/{value}');
 element('endpoint-search').value = 'nope';
@@ -525,7 +552,75 @@ await waitFor('empty rail', () => doc.querySelectorAll('#endpoint-list button').
 check('no-match state', text('endpoint-state'), 'No endpoint matches "nope".');
 element('endpoint-search').value = '';
 element('endpoint-search').dispatchEvent(new window.Event('input', { bubbles: true }));
-await waitFor('full rail', () => doc.querySelectorAll('#endpoint-list button').length === 18);
+await waitFor('full rail', () => doc.querySelectorAll('#endpoint-list button').length === 19);
+
+// --- 7b. the two rows that share one API path --------------------------------------
+// The duplicate path has to stay separately addressable and separately describable. The rail keys
+// selection on the row's listing index (`src/server/playground.js`) and renders the declared port as
+// its own marker, so a path published on two listeners shows which listener each row belongs to and
+// exactly one of them can be current. Pinned as exact accessible names and exact marker text, in
+// listing order.
+const HEALTH_LABEL_UNPORTED = 'Use GET /v1/services/health - Reports the service name and version';
+const HEALTH_LABEL_PORTED =
+    'Use GET /v1/services/health on port 8010 - Reports the service name and version on the isolated 8010 listener';
+check(
+    'the two rows for one path have distinct accessible names',
+    [...doc.querySelectorAll('#endpoint-list button[aria-label^="Use GET /v1/services/health "]')]
+        .map((button) => button.getAttribute('aria-label'))
+        .join('\n'),
+    [HEALTH_LABEL_UNPORTED, HEALTH_LABEL_PORTED].join('\n'),
+);
+// The listener marker: present and exact on the ported row, absent on every other row. An unported
+// row has NO marker at all - "no marker" is the page's statement that the row is on the default
+// listener - so the rail cannot invent a listener the listing did not declare. This is also what
+// keeps the 19-row rail pin above untouched: the path and summary nodes still hold exactly their own
+// text, because the port is a separate node.
+const healthRows = [...doc.querySelectorAll('#endpoint-list button[aria-label^="Use GET /v1/services/health "]')];
+check('the ported row names its listener', markerText(healthRows[1]), 'port 8010');
+check('the unported row renders no listener marker', markerText(healthRows[0]), 'no listener marker');
+check(
+    'exactly one row in the whole rail names a listener',
+    [...doc.querySelectorAll('#endpoint-list .endpoint-port')].map((node) => node.textContent).join('\n'),
+    'port 8010',
+);
+// Selection, from both sides of the pair: `renderList` rebuilds the rail on every click, so each row
+// is re-resolved from the live DOM rather than from a node that a previous render detached.
+rowFor(HEALTH_LABEL_UNPORTED).click();
+check('selecting the unported row marks exactly one row', doc.querySelectorAll('#endpoint-list [aria-current]').length, 1);
+check('selecting the unported row marks that row', currentRowLabels(), HEALTH_LABEL_UNPORTED);
+// An unported row states nothing extra: for it "this origin" IS the declared listener, so the
+// state line stays empty exactly as it did before the port slot existed.
+check('the unported row leaves the composer state line empty', text('composer-state'), '');
+rowFor(HEALTH_LABEL_PORTED).click();
+check('selecting the ported row marks exactly one row', doc.querySelectorAll('#endpoint-list [aria-current]').length, 1);
+check('selecting the ported row marks that row', currentRowLabels(), HEALTH_LABEL_PORTED);
+// The composer still composes the same API path: the port is a listener, never part of the URL, so
+// the ported row dispatches against the very same origin/path the unported one does (the fixture
+// transport answers `GET /v1/services/health` identically for both).
+check('the ported row composes the shared API path', text('composer-target'), 'GET /v1/services/health');
+check('the ported row keeps its own summary', text('request-summary'), 'Reports the service name and version on the isolated 8010 listener');
+// WHERE THE REQUEST ACTUALLY GOES (`src/server/playground.js::selectEntry`). The row's marker says
+// `port 8010`, but this page is served by the DEFAULT listener only (`app_for`'s `port.is_none()`
+// branch) and fetches same-origin, so Send can only ever be answered by the listener that served
+// the page. Selecting the row has to say that, in the `role="status"` composer state line, or the
+// marker reads as a promise the page cannot keep. Pinned as one exact sentence: the wording is the
+// affordance, so a reword is an explicit edit here (and in README's playground bullet).
+check(
+    'the ported row says which listener answers it',
+    text('composer-state'),
+    'Port 8010 is a separate listener, and this page can only ask the origin that served it: ' +
+        'Send dispatches GET /v1/services/health on this origin, never on port 8010.',
+);
+// And it is a state line, not a rewrite of the composer: the target/method/path nodes above stay
+// exactly what the unported twin composes, which is the evidence that the note informs rather than
+// changes the request.
+check('the note does not touch the method field', value('request-method'), 'GET');
+check('the note does not touch the path field', value('request-path'), '/v1/services/health');
+check('a GET row hides the body editor', element('body-group').hidden, true);
+// No dispatch here on purpose: the socket-level claim that this row's path really is answered on
+// its own listener is pinned over a real TCP socket by
+// `tests/server_http.rs::the_same_api_path_is_served_on_both_listeners_at_the_same_time`, and the
+// playground is single-origin, so it could only ever reach one listener from here.
 
 // --- 8. POST: the editor, the automatic content-type, the real round trip --------
 const postRow = rowFor('Use POST /v1/services/echo - Echoes the posted `value` unchanged');
@@ -732,7 +827,7 @@ check('cleared timing', text('response-timing'), '');
 
 // --- 17. a listing that fails leaves a usable, honest page, and a way back -------
 const brokenDom = new JSDOM(assets.served['/'], {
-    url: BASE || 'http://127.0.0.1:5001/',
+    url: BASE || 'http://127.0.0.1:8000/',
     contentType: 'text/html',
     runScripts: 'outside-only',
     pretendToBeVisual: true,
@@ -762,12 +857,12 @@ brokenDoc.getElementById('endpoint-search').dispatchEvent(new brokenDom.window.E
 // (the collapsed one here) is re-derived from the listing that now answers.
 const retried = instrument(brokenDom.window);
 brokenDoc.getElementById('reload-endpoints').click();
-await waitFor('the retried rail', () => brokenDoc.querySelectorAll('#endpoint-list button').length === 18);
+await waitFor('the retried rail', () => brokenDoc.querySelectorAll('#endpoint-list button').length === 19);
 check('the retry issued only the listing request', retried.length, 1);
 check('the retry requested the listing', retried[0].url, '/v1/services/routes');
 check('the retry cleared the error line', brokenText('endpoint-state'), '');
 check('the retry hid itself', brokenDoc.getElementById('reload-endpoints').hidden, true);
-check('the retry reported the count', brokenText('endpoint-count'), '18 endpoints');
+check('the retry reported the count', brokenText('endpoint-count'), '19 endpoints');
 check('the retry enabled the composer', brokenDoc.getElementById('send').disabled, false);
 check('the retry pre-loaded the first entry', brokenText('composer-target'), 'ANY /v1/harness');
 brokenDom.window.close();

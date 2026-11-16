@@ -33,6 +33,15 @@
 //! as dispatches - the literal `ANY` verb, answered by the harness dispatcher - while the REST
 //! catalogue and the `harness.v1` upgrade behind them are proven end to end in
 //! `tests/harness_gateway.rs`.
+//!
+//! Since the route grammar grew an optional `, port:` trailer, the listing is ONE table for every
+//! listener while a router is built per listener: `app()` is `app_for(None, ..)` (the default
+//! listener, unported groups only) and `app_for(Some(N), ..)` serves the groups that declare port
+//! N. The `health` sample is therefore listed TWICE - the same API path, once unported and once on
+//! 8010 - which is why the listing below is nineteen rows and not eighteen. The port semantics are
+//! pinned by the three tests at the end of this file: the ported row carries a literal
+//! `"port": 8010` key, the 8010 listener answers the ported mount and 404s the unported ones, and
+//! `declared_ports()` reports the group without a router being started.
 
 use std::fs;
 use std::io;
@@ -51,7 +60,9 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use typecrate_services::server::{AppState, MAX_REQUEST_BODY_BYTES, app, normalize_lexically};
+use typecrate_services::server::{
+    AppState, MAX_REQUEST_BODY_BYTES, app, app_for, declared_ports, normalize_lexically,
+};
 
 /// Seconds a shutdown is allowed to take before the test calls it hung. Graceful
 /// shutdown here is "stop accepting, finish what is in flight", which is
@@ -179,9 +190,25 @@ struct TestServer {
 impl TestServer {
     /// Serves THE library router (`app(state)`), the same function
     /// `src/bin/server.rs` serves, so these tests cannot drift from the executable.
+    /// `app()` is the DEFAULT listener, i.e. only the route groups that declare no port.
     async fn start(state: AppState) -> Self {
+        Self::serve(app(state)).await
+    }
+
+    /// Serves the listener-scoped router (`app_for(port, state)`), i.e. exactly the route groups
+    /// whose `, port:` trailer matches `port` (`None` is the default listener). Used to prove that
+    /// a path declared on two ports really is served twice, and that a port listener has no
+    /// unported route on it at all.
+    async fn serve_for(port: Option<u16>, state: AppState) -> Self {
+        Self::serve(app_for(port, state)).await
+    }
+
+    /// Binds one ephemeral loopback socket and serves `router` on it.
+    async fn serve(router: axum::Router) -> Self {
         // Port 0 == ask the OS for a free port: parallel `cargo test` workers and a
         // busy dev machine can never collide, and nothing is killed on the way in.
+        // The port the ROUTE groups declare is a routing key, never the socket this
+        // binds, so a `, port: 8010` group is still tested on an ephemeral port.
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("an ephemeral loopback port is available");
@@ -193,7 +220,7 @@ impl TestServer {
         // it through an internal pin (tokio 1.54.1 `oneshot.rs:1268`).
         let (tx, rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app(state))
+            axum::serve(listener, router)
                 // The test's own graceful-shutdown path: dropping the sender would
                 // also end this, but an explicit signal keeps the intent obvious.
                 .with_graceful_shutdown(async move {
@@ -1926,7 +1953,8 @@ async fn pets_list_ignores_every_query_parameter_it_does_not_declare() {
 const PLAYGROUND_CSP: &str = "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'";
 
 /// The whole listing, exactly as the generated table serialises it today: the three `/v1/harness`
-/// rows plus the fifteen sample endpoints, in order, with the summaries their route files author.
+/// rows, the fifteen sample endpoints, and the one demo row that declares a port - in order, with
+/// the summaries their route files author.
 ///
 /// Two orders combine into this sequence, and both are pinned elsewhere:
 ///   * between files it is the scanner's registration order (byte-wise comparison
@@ -1946,8 +1974,16 @@ const PLAYGROUND_CSP: &str = "default-src 'self'; img-src 'self' data:; script-s
 /// same six rows in the same order (collection `GET`/`POST`, then `{id}`
 /// `GET`/`PUT`/`PATCH`/`DELETE`), which is the order their route files declare them.
 ///
-/// Like `health_body`, this is a value edited on purpose: adding a sample endpoint
-/// or rewording a summary changes the listing, and the listing is asserted exactly.
+/// The table is NOT filtered by port (`build_support/mod.rs`, `GENERATED_METADATA_FUNCTION`): it is
+/// one row per mounted `(method, path, port)`, so the `health` sample - declared twice in
+/// `examples/endpoints/health/health-route.rs`, once unported and once with `, port: 8010` -
+/// contributes the row at index 5 AND the `port`-carrying row at index 6, in the order the file
+/// writes the two groups. That duplicate path is deliberate and is what makes the listing answer
+/// "which listener serves this API path", so the two summaries differ on purpose; nothing else in
+/// the table repeats a path.
+///
+/// Like `health_body`, this is a value edited on purpose: adding a sample endpoint, declaring a
+/// port, or rewording a summary changes the listing, and the listing is asserted exactly.
 fn route_table() -> JsonValue {
     json!([
         // T6: the `/v1/harness` bridge, registered FIRST because its route file lives in the
@@ -1983,6 +2019,16 @@ fn route_table() -> JsonValue {
             "method": "GET",
             "path": "/v1/services/health",
             "summary": "Reports the service name and version",
+        },
+        // The same API path, declared a second time in the same route file with `, port: 8010`.
+        // `port` is the ONLY key this row has that the row above lacks, and it is last
+        // (`EndpointMeta`'s last field, `skip_serializing_if`), so a pre-port row never grows a
+        // `"port": null`. It is served by its own listener, never by the one `app()` builds.
+        {
+            "method": "GET",
+            "path": "/v1/services/health",
+            "summary": "Reports the service name and version on the isolated 8010 listener",
+            "port": 8010,
         },
         {
             "method": "GET",
@@ -2111,28 +2157,55 @@ fn assert_no_source_leak(text: &str, what: &str) {
     }
 }
 
-/// Parses a listing body into `(method, path, summary)` triples, pinning the exact
-/// per-entry shape on the way: `method`, `path`, `summary`, nothing else.
+/// Parses a listing body into `(method, path, summary, port)` rows, pinning the exact
+/// per-entry shape on the way.
 ///
-/// The key-order assertion holds under both `serde_json` map implementations
-/// (a plain `Map` is a `BTreeMap`, so the keys come back sorted, and
-/// `method < path < summary` byte-wise; with `preserve_order` it is the struct's
-/// field order, which is the same sequence).
-fn listing_entries(body: &JsonValue) -> Vec<(&str, &str, &str)> {
+/// Reads the listing as `(method, path, summary, port)` rows, in order, pinning the SHAPE of every
+/// row against the expected table row at the same index.
+///
+/// The shape check stays exact rather than "contains": a row's key list must EQUAL the expected
+/// row's key list, so an unported row may not grow a `"port": null` and a ported row may not lose
+/// the key or gain anything else. `serde_json`'s `Map` is a `BTreeMap` unless `preserve_order` is
+/// on (it is not: `Cargo.toml` declares plain `serde_json = "1"`), so both sides come out in the
+/// same alphabetical order and this comparison is key-SET equality; the published FIELD ORDER is
+/// pinned over the raw response bytes instead, by `PORTED_ROW_BYTES` below.
+///
+/// `as_u64` is what rejects a non-numeric port: it answers `None` for a float, a string or a
+/// negative, so `"port": "8010"` and `"port": 80100` both fail here rather than being read as the
+/// same row.
+fn listing_entries<'a>(
+    body: &'a JsonValue,
+    table: &JsonValue,
+) -> Vec<(&'a str, &'a str, &'a str, Option<u16>)> {
     let entries = body
         .as_array()
         .unwrap_or_else(|| panic!("the listing is not a JSON array: {body}"));
+    let expected = table
+        .as_array()
+        .unwrap_or_else(|| panic!("the expected table is not a JSON array: {table}"));
+    assert_eq!(
+        entries.len(),
+        expected.len(),
+        "the listing has {} rows, the expected table has {}",
+        entries.len(),
+        expected.len()
+    );
     entries
         .iter()
-        .map(|entry| {
+        .zip(expected)
+        .map(|(entry, expected_entry)| {
             let object = entry
                 .as_object()
                 .unwrap_or_else(|| panic!("a listing entry is not an object: {entry}"));
+            let expected_object = expected_entry.as_object().unwrap_or_else(|| {
+                panic!("the expected table entry is not an object: {expected_entry}")
+            });
             let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            let expected_keys: Vec<&str> = expected_object.keys().map(String::as_str).collect();
             assert_eq!(
                 keys,
-                ["method", "path", "summary"],
-                "unexpected listing entry shape: {entry}"
+                expected_keys,
+                "unexpected listing entry shape (the table row at this index is {expected_entry}): {entry}"
             );
             let method = object
                 .get("method")
@@ -2146,10 +2219,35 @@ fn listing_entries(body: &JsonValue) -> Vec<(&str, &str, &str)> {
                 .get("summary")
                 .and_then(JsonValue::as_str)
                 .unwrap_or_else(|| panic!("`summary` is not a string: {entry}"));
-            (method, path, summary)
+            // The key list above already proves `port` is absent exactly when the expected row
+            // says it is, so this only has to read the value it carries: an absent key is `None`,
+            // a present one must be a whole number that fits `u16`.
+            let port = object.get("port").map(|value| {
+                let number = value
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("`port` is not an unsigned integer: {entry}"));
+                u16::try_from(number)
+                    .unwrap_or_else(|_| panic!("`port` is outside `u16`: {entry}"))
+            });
+            (method, path, summary, port)
         })
         .collect()
 }
+
+/// The port the `health` sample declares with its second `, port:` group
+/// (`examples/endpoints/health/health-route.rs`), i.e. the only declared port in this build.
+const PORTED_HEALTH_PORT: u16 = 8010;
+
+/// The one row of the listing that carries a port, spelled as the exact BYTES the response
+/// contains: field order is `EndpointMeta`'s declaration order, so `port` is last, and `Json`
+/// writes compact JSON (no spaces). Pinned as bytes because `serde_json::Value` cannot express
+/// key order (see [`listing_entries`]), and "an unported row never grew a `\"port\": null`" is
+/// a claim about the published bytes, not about a parsed map.
+const PORTED_ROW_BYTES: &str = concat!(
+    r#"{"method":"GET","path":"/v1/services/health","#,
+    r#""summary":"Reports the service name and version on the isolated 8010 listener","#,
+    r#""port":8010}"#,
+);
 
 #[tokio::test]
 async fn root_serves_the_embedded_playground_document() {
@@ -2326,7 +2424,7 @@ async fn routes_metadata_lists_exactly_the_generated_endpoints() {
         .unwrap_or_else(|err| panic!("status {status} listing body is not JSON: {raw:?} ({err})"));
     assert_no_source_leak(&raw, "the endpoint listing");
 
-    let entries = listing_entries(&body);
+    let entries = listing_entries(&body, &route_table());
 
     // One comparison pins the count, the order, the per-entry key set and every
     // string, summaries included: a `Map` compares by contents, so an added or
@@ -2339,8 +2437,49 @@ async fn routes_metadata_lists_exactly_the_generated_endpoints() {
     );
     assert_eq!(
         entries.len(),
-        18,
-        "the listing did not report the three harness rows plus the fifteen sample endpoints: {raw}"
+        19,
+        "the listing did not report the three harness rows, the fifteen sample endpoints and the \
+         one ported row: {raw}"
+    );
+
+    // The port half of the shape, asserted as an exact list rather than a filter that merely
+    // "finds" a ported row: exactly ONE row carries `port`, it is the second `GET
+    // /v1/services/health` declaration, and the number is 8010. Every other row must have no
+    // `port` key at all, which is what `skip_serializing_if` is for - a `"port": null` on an
+    // unported row would be a wire-format change hiding behind this test's `body` comparison.
+    let ported: Vec<(&str, &str, u16)> = entries
+        .iter()
+        .filter_map(|&(method, path, _, port)| port.map(|port| (method, path, port)))
+        .collect();
+    assert_eq!(
+        ported,
+        [("GET", "/v1/services/health", PORTED_HEALTH_PORT)],
+        "the listing does not carry exactly the declared port rows: {raw}"
+    );
+    // The same claim from the other side, as bytes: the ported row is written with `port` LAST
+    // (`EndpointMeta`'s field order) and the unported twin right before it stays three keys.
+    assert!(
+        raw.contains(PORTED_ROW_BYTES),
+        "the ported row is not the published bytes:\n{raw}"
+    );
+    assert_eq!(
+        raw.matches(PORTED_ROW_BYTES).count(),
+        1,
+        "the ported row appears once in the listing: {raw}"
+    );
+    // The unported twin, byte for byte, immediately before it: two rows for one API path, and
+    // only the second one names a listener.
+    let unported_row_bytes = concat!(
+        r#"{"method":"GET","path":"/v1/services/health","#,
+        r#""summary":"Reports the service name and version"}"#,
+    );
+    assert!(
+        raw.contains(&format!("{unported_row_bytes},{PORTED_ROW_BYTES}")),
+        "the two `health` rows are not adjacent in declaration order: {raw}"
+    );
+    assert!(
+        !raw.contains(r#""port":null"#),
+        "an unported row grew a `\"port\": null`: {raw}"
     );
 
     // Built-ins are absent from their own listing by construction: the generated
@@ -2356,7 +2495,7 @@ async fn routes_metadata_lists_exactly_the_generated_endpoints() {
         "/v1/services/routes",
     ] {
         assert!(
-            !entries.iter().any(|&(_, listed, _)| listed == builtin),
+            !entries.iter().any(|&(_, listed, _, _)| listed == builtin),
             "the listing advertises the builtin path {builtin:?}: {raw}"
         );
     }
@@ -2365,7 +2504,7 @@ async fn routes_metadata_lists_exactly_the_generated_endpoints() {
     // files); these rules are the part that must survive any rewording, because a
     // summary is rendered as list text in the playground and a source path in it
     // would be an information leak (R4).
-    for &(method, path, summary) in &entries {
+    for &(method, path, summary, _port) in &entries {
         assert!(
             !summary.trim().is_empty(),
             "{method} {path} is listed without a summary"
@@ -2381,6 +2520,93 @@ async fn routes_metadata_lists_exactly_the_generated_endpoints() {
             );
         }
     }
+
+    // Two rows that share a path must not share a summary. The path is identical by definition
+    // and `port` is absent on the default-listener row, so the summary is the ONLY thing in the
+    // row that says which listener it belongs to (`examples/endpoints/health/health-route.rs`
+    // relies on this when it declares `/v1/services/health` twice).
+    for (index, listed) in entries.iter().enumerate() {
+        for other in &entries[index + 1..] {
+            if listed.1 == other.1 {
+                assert_ne!(
+                    listed.2, other.2,
+                    "{} is listed twice with the same summary, so a reader cannot tell the \
+                     two listeners apart",
+                    listed.1
+                );
+            }
+        }
+    }
+
+    server.shutdown().await;
+}
+
+// Item 1 of the port review: WHERE a duplicated path is described. This crate publishes no
+// OpenAPI document at all - no `utoipa`/`async-openapi` dependency (`Cargo.toml`'s only deps are
+// axum, tokio, serde, serde_json and the harness path dependency), no `#[endpoint]` attribute and
+// no `OpenApi` value anywhere in `src/`. The single machine-readable description a build emits is
+// `GET /v1/services/routes`, and the settlement that follows from that is pinned here rather than
+// asserted in prose: it is an ORDERED ARRAY, one row per declared `(method, path, port)`, with no
+// path-keyed map to merge the two `GET /v1/services/health` declarations into one entry with one
+// surviving summary. If an OpenAPI layer is ever added, the key assertions below fail loudly and
+// force the same decision to be re-made on purpose (a path item IS keyed by path alone, so the two
+// listeners would then need a `servers` entry each - which is why nothing was invented here).
+#[tokio::test]
+async fn a_path_declared_on_two_ports_is_described_twice_and_never_merged() {
+    let server = TestServer::start(AppState::new(scratch_root("routes-dup-path"))).await;
+
+    let response = client()
+        .get(server.url("/v1/services/routes"))
+        .send()
+        .await
+        .expect("the endpoint listing is reachable");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let status = response.status();
+    let raw = response.text().await.expect("the listing has a body");
+    let body: JsonValue = serde_json::from_str(&raw)
+        .unwrap_or_else(|err| panic!("status {status} listing body is not JSON: {raw:?} ({err})"));
+
+    // Shape first: an array, never an object. `paths`/`servers`-style documents are objects keyed
+    // by path, and that keying is exactly the thing that would collapse a duplicated path.
+    assert!(
+        body.is_array(),
+        "the description is not an array of rows: {raw}"
+    );
+    for key in ["\"openapi\"", "\"paths\"", "\"servers\"", "\"components\""] {
+        assert!(
+            !raw.contains(key),
+            "the listing carries the OpenAPI document key {key}, so a path-keyed merge is now \
+             possible and this test's premise is gone: {raw}"
+        );
+    }
+
+    // Both declarations survive verbatim, in the order the route file writes them: unported first,
+    // the `port`-carrying one second. Written as exact tuples - the whole row, every field - so a
+    // merge (one row), a reword (summary), or a listener change (port) all fail HERE.
+    let entries = listing_entries(&body, &route_table());
+    let health: Vec<(&str, &str, &str, Option<u16>)> = entries
+        .iter()
+        .copied()
+        .filter(|&(_, path, _, _)| path == "/v1/services/health")
+        .collect();
+    assert_eq!(
+        health,
+        [
+            (
+                "GET",
+                "/v1/services/health",
+                "Reports the service name and version",
+                None
+            ),
+            (
+                "GET",
+                "/v1/services/health",
+                "Reports the service name and version on the isolated 8010 listener",
+                Some(PORTED_HEALTH_PORT)
+            ),
+        ],
+        "the two declarations of one API path are not both described, in declaration order: {raw}"
+    );
 
     server.shutdown().await;
 }
@@ -2398,6 +2624,10 @@ struct Dispatch {
     /// one belongs to, before anything is sent.
     method: &'static str,
     template: &'static str,
+    /// The listener this row's route group declares, mirroring `EndpointMeta::port`: `None` is
+    /// the default listener (`app()`), `Some(N)` is the listener `app_for(Some(N), ..)` builds.
+    /// The plan/Listing comparison asserts it per row, so a row cannot move listeners silently.
+    port: Option<u16>,
     /// Request body text; `None` sends no body.
     body: Option<&'static str>,
     status: reqwest::StatusCode,
@@ -2407,7 +2637,9 @@ struct Dispatch {
     location: Option<String>,
 }
 
-/// Shorthand so the table below stays one row per line.
+/// Shorthand so the table below stays one row per line. Every plain `dispatch(..)` row is an
+/// UNPORTED group, i.e. it belongs to the default listener; the ported rows use
+/// [`dispatch_on_port`] so the listener is written down explicitly.
 fn dispatch(
     method: &'static str,
     template: &'static str,
@@ -2419,6 +2651,7 @@ fn dispatch(
     Dispatch {
         method,
         template,
+        port: None,
         body,
         status,
         answer: answer.into(),
@@ -2426,7 +2659,30 @@ fn dispatch(
     }
 }
 
-/// The eighteen rows of `route_table`, in that order, each with its contract answer.
+/// The same row, declared on a named listener (`, port: N` in its route file). It is dispatched
+/// against `app_for(Some(N), ..)` on its own socket, never against the default listener.
+fn dispatch_on_port(
+    port: u16,
+    method: &'static str,
+    template: &'static str,
+    body: Option<&'static str>,
+    status: reqwest::StatusCode,
+    answer: impl Into<String>,
+    location: Option<String>,
+) -> Dispatch {
+    Dispatch {
+        method,
+        template,
+        port: Some(port),
+        body,
+        status,
+        answer: answer.into(),
+        location,
+    }
+}
+
+/// The nineteen rows of `route_table`, in that order, each with its contract answer and the
+/// listener it is served on.
 ///
 /// The three `ANY` rows come first, and they are dispatched with the LITERAL method the listing
 /// advertises: `axum::routing::any` matches every verb, so an `ANY` request really does reach the
@@ -2435,7 +2691,14 @@ fn dispatch(
 /// sentences are what make this a precedence proof as well as a dispatch proof: the two harness
 /// mounts answer the SAME wrong verb with two DIFFERENT messages, so a router that handed
 /// `/v1/harness/stream` to the catch-all would fail here instead of quietly passing.
-fn dispatch_plan() -> [Dispatch; 18] {
+///
+/// Row 6 is the only one with a port, and it is dispatched against its OWN listener. Its answer
+/// happens to be the same body row 5 answers on the default listener - the same handler, and a
+/// port is not part of the URL - which is exactly the point: two listeners, one API path, neither
+/// declaration overriding the other. The isolation half (what the 8010 listener does NOT serve)
+/// is pinned by the dedicated port tests below, because on this particular path the default
+/// listener answers for its own unported twin and cannot tell the two apart.
+fn dispatch_plan() -> [Dispatch; 19] {
     let pets = pets();
     let locations = locations();
     [
@@ -2486,6 +2749,19 @@ fn dispatch_plan() -> [Dispatch; 18] {
             None,
         ),
         dispatch(
+            "GET",
+            "/v1/services/health",
+            None,
+            reqwest::StatusCode::OK,
+            r#"{"service":"typecrate-services","version":"1.0.2"}"#,
+            None,
+        ),
+        // The SAME API path on its own listener. The row is dispatched against
+        // `app_for(Some(8010), ..)`, which is the only router this group is mounted into, and the
+        // answer is byte-identical to the row above because the port never enters the URL or the
+        // body - only the listener changes.
+        dispatch_on_port(
+            PORTED_HEALTH_PORT,
             "GET",
             "/v1/services/health",
             None,
@@ -2601,6 +2877,11 @@ async fn every_listed_endpoint_is_the_method_the_socket_dispatches() {
     // `[]` rows are only true for a store nothing has created into yet).
     let store = StoreFixture::new("routes-dispatch");
     let server = TestServer::start(store.state()).await;
+    // The declared port gets a listener of its own, built by `app_for(Some(N), ..)` on its own
+    // ephemeral socket. Both listeners share this data root, which is fine for the health sample
+    // (it reads no store) and is what lets one plan row per listing row be dispatched against
+    // whichever listener the row declares.
+    let isolated = TestServer::serve_for(Some(PORTED_HEALTH_PORT), store.state()).await;
     let client = client();
 
     let listing = json_body(
@@ -2611,16 +2892,21 @@ async fn every_listed_endpoint_is_the_method_the_socket_dispatches() {
             .expect("the listing is reachable"),
     )
     .await;
-    let entries = listing_entries(&listing);
+    let entries = listing_entries(&listing, &route_table());
 
-    // The plan has to BE the listing: same rows, same order, same advertised methods and paths.
-    // Without this, the dispatch checks below could be proving some other table's contract.
+    // The plan has to BE the listing: same rows, same order, same advertised methods, paths AND
+    // declared ports. Without this, the dispatch checks below could be proving some other table's
+    // contract - and a row that quietly lost its `port` key would still "pass" a method/path-only
+    // comparison while being dispatched against the wrong listener.
     let plan = dispatch_plan();
-    let listed: Vec<(&str, &str)> = entries
+    let listed: Vec<(&str, &str, Option<u16>)> = entries
         .iter()
-        .map(|&(method, path, _)| (method, path))
+        .map(|&(method, path, _, port)| (method, path, port))
         .collect();
-    let planned: Vec<(&str, &str)> = plan.iter().map(|row| (row.method, row.template)).collect();
+    let planned: Vec<(&str, &str, Option<u16>)> = plan
+        .iter()
+        .map(|row| (row.method, row.template, row.port))
+        .collect();
     assert_eq!(
         listed, planned,
         "the listing and the dispatch plan are not the same rows in the same order"
@@ -2638,6 +2924,15 @@ async fn every_listed_endpoint_is_the_method_the_socket_dispatches() {
         let label = format!("{} {}", row.method, row.template);
         let method = reqwest::Method::from_bytes(row.method.as_bytes())
             .unwrap_or_else(|err| panic!("the listing advertises an unusable method: {err}"));
+        // The listener is part of the row: an unported group is dispatched against `app()`, a
+        // ported group against the `app_for` router that mounts it. Anything else in the listing
+        // is a plan bug and fails loudly rather than being sent to a listener that would answer
+        // the same path anyway.
+        let listener = match row.port {
+            None => &server,
+            Some(PORTED_HEALTH_PORT) => &isolated,
+            Some(port) => panic!("the dispatch plan declares an unmodelled port {port}"),
+        };
         let concrete = row
             .template
             .replace("{value}", PARAM_PROBE_VALUE)
@@ -2646,7 +2941,7 @@ async fn every_listed_endpoint_is_the_method_the_socket_dispatches() {
             // path (`/v1/harness/probe`) the harness dispatcher can answer, exactly as the `{id}`
             // and `{value}` stand-ins turn their templates into real requests.
             .replace("{*rest}", PARAM_PROBE_VALUE);
-        let answer = send(&client, &server, method, &concrete, row.body).await;
+        let answer = send(&client, listener, method, &concrete, row.body).await;
         assert_eq!(
             answer.status, row.status,
             "{label} ({concrete}) is advertised by the listing but not dispatched"
@@ -2731,6 +3026,9 @@ async fn every_listed_endpoint_is_the_method_the_socket_dispatches() {
     assert_eq!(head.content_type.as_deref(), Some("application/json"));
     assert_eq!(head.body, "");
 
+    // Both listeners shut down: the isolated one first so a leaked serve task cannot outlive the
+    // test that started it.
+    isolated.shutdown().await;
     server.shutdown().await;
 }
 
@@ -2802,4 +3100,218 @@ async fn the_builtin_surface_leaves_the_discovered_table_intact() {
     }
 
     server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// The `, port:` contract: one API path, several listeners, neither overriding the
+// other.
+//
+// These three tests are the runtime half of the route grammar's optional port trailer. The
+// listing half lives in `routes_metadata_lists_exactly_the_generated_endpoints` above (the
+// ported row and its exact `"port":8010` bytes); what is pinned here is what a socket reports,
+// i.e. that `app_for(port, ..)` mounts ONLY the groups that declare that port:
+//
+//   * `app()` == `app_for(None, ..)` - the default listener, every UNPORTED group;
+//   * `app_for(Some(N), ..)` - only the groups that wrote `, port: N`;
+//   * a group whose port does not match contributes no `.route()` call at all, so the path does
+//     not exist on that listener: a plain 404 from the fallback, NEVER a router 405 with an
+//     `allow` header (`src/server/metadata.rs`, "What `port` means"). The 404/405 pair below is
+//     therefore the load-bearing assertion - a router that ignored the trailer would answer
+//     `allow: GET,HEAD` everywhere and still pass a status-only check.
+//
+// Nothing here binds a real port NUMBER: `PORTED_HEALTH_PORT` is a routing key, and each listener
+// is served on an ephemeral `127.0.0.1:0` socket, so the tests never collide with a running
+// server or with each other.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_same_api_path_is_served_on_both_listeners_at_the_same_time() {
+    // One data root, two routers, two sockets. `examples/endpoints/health/health-route.rs`
+    // declares the same API path once without a port and once with `, port: 8010`; that is only a
+    // correct declaration if both listeners really answer it, at the same time, neither replacing
+    // the other.
+    let store = StoreFixture::new("port-both-listeners");
+    let default_listener = TestServer::start(store.state()).await;
+    let ported_listener = TestServer::serve_for(Some(PORTED_HEALTH_PORT), store.state()).await;
+    let client = client();
+
+    // Two listeners means two sockets. If `app_for` ignored its `port` argument, both handles
+    // would describe the same router and the assertions below would be vacuous - so the addresses
+    // are pinned apart first.
+    assert_ne!(
+        default_listener.base_url, ported_listener.base_url,
+        "the default listener and the {PORTED_HEALTH_PORT} listener must be separate sockets"
+    );
+
+    // Interleaved rather than one after the other: a request to one listener must not drain,
+    // close or otherwise disturb the other. Both answers are the exact contract body, because a
+    // port is not part of the URL - the same handler answers on both listeners and neither one
+    // stamps the port into the response.
+    let expected = health_body();
+    for round in 0..2u8 {
+        let on_default = client
+            .get(default_listener.url("/v1/services/health"))
+            .send()
+            .await
+            .unwrap_or_else(|err| {
+                panic!("round {round}: the default listener is unreachable: {err}")
+            });
+        assert_eq!(on_default.status(), reqwest::StatusCode::OK);
+        assert_eq!(json_body(on_default).await, expected);
+
+        let on_port = client
+            .get(ported_listener.url("/v1/services/health"))
+            .send()
+            .await
+            .unwrap_or_else(|err| {
+                panic!("round {round}: the ported listener is unreachable: {err}")
+            });
+        assert_eq!(on_port.status(), reqwest::StatusCode::OK);
+        assert_eq!(json_body(on_port).await, expected);
+    }
+
+    ported_listener.shutdown().await;
+    default_listener.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_port_listener_serves_only_the_groups_that_declare_it() {
+    let store = StoreFixture::new("port-isolation");
+    let default_listener = TestServer::start(store.state()).await;
+    let ported_listener = TestServer::serve_for(Some(PORTED_HEALTH_PORT), store.state()).await;
+    let client = client();
+
+    // Control half first: the unported paths really are mounted on the default listener. Without
+    // this, the 404s below could be explained by a router that answers nothing at all instead of
+    // by port scoping. `assert_ne!(.., NOT_FOUND)` rather than `== OK` on purpose: the failure
+    // being excluded here is "the path does not exist", and a 405 from a wrong verb would prove
+    // the same thing - the exact statuses of these routes are pinned by the tests above.
+    let pets = pets();
+    let locations = locations();
+    let pets_one = by_id_path(&pets, 1);
+    for (method, path) in [
+        (reqwest::Method::GET, pets.collection),
+        (reqwest::Method::GET, locations.collection),
+        (reqwest::Method::GET, "/v1/services/echo/probe"),
+        (reqwest::Method::GET, "/v1/harness"),
+    ] {
+        let label = format!("{method} {path}");
+        let answer = send(&client, &default_listener, method, path, None).await;
+        assert_ne!(
+            answer.status,
+            reqwest::StatusCode::NOT_FOUND,
+            "{label} is an unported mount but the default listener 404s it"
+        );
+    }
+
+    // The ported mount IS registered on its own listener, and a wrong verb there is a router 405
+    // naming the verbs the ported group declares. That is the positive half of the scoping proof:
+    // the group was mounted, on this listener and for that verb set only.
+    let wrong_verb = send(
+        &client,
+        &ported_listener,
+        reqwest::Method::DELETE,
+        "/v1/services/health",
+        None,
+    )
+    .await;
+    assert_eq!(
+        wrong_verb.status,
+        reqwest::StatusCode::METHOD_NOT_ALLOWED,
+        "the ported group is not mounted on the listener it declares"
+    );
+    assert_eq!(
+        wrong_verb.allow.as_deref(),
+        Some("GET,HEAD"),
+        "the ported listener reports a different verb set than the ported `GET` group"
+    );
+
+    // Every UNPORTED path is simply absent from that listener. Not a 405: a group whose port does
+    // not match contributes no `.route()` call, so matchit has no node for the path there and the
+    // fallback answers. The absent `allow` header is the proof - an `allow` on a 404 would mean
+    // the `, port:` trailer was ignored and the whole table was mounted everywhere.
+    for (method, path) in [
+        (reqwest::Method::GET, pets.collection),
+        (reqwest::Method::POST, pets.collection),
+        (reqwest::Method::GET, pets_one.as_str()),
+        (reqwest::Method::GET, locations.collection),
+        (reqwest::Method::GET, "/v1/services/echo/probe"),
+        (reqwest::Method::GET, "/v1/harness"),
+        (reqwest::Method::GET, "/v1/harness/probe"),
+    ] {
+        let label = format!("{method} {path}");
+        let answer = send(&client, &ported_listener, method, path, None).await;
+        assert_eq!(
+            answer.status,
+            reqwest::StatusCode::NOT_FOUND,
+            "{label} is unported, yet the ported listener answers it"
+        );
+        assert_eq!(
+            answer.allow, None,
+            "{label} carried an `allow` header on the ported listener, so the path is mounted \
+             there after all and the port trailer was ignored"
+        );
+    }
+
+    // And the default listener still owns its own `health` mount: same wrong verb, same 405, same
+    // `allow`. Two listeners, two independent method routers, one API path.
+    let health_on_default = send(
+        &client,
+        &default_listener,
+        reqwest::Method::DELETE,
+        "/v1/services/health",
+        None,
+    )
+    .await;
+    assert_eq!(
+        health_on_default.status,
+        reqwest::StatusCode::METHOD_NOT_ALLOWED,
+        "the default listener lost its unported `health` mount"
+    );
+    assert_eq!(
+        health_on_default.allow.as_deref(),
+        Some("GET,HEAD"),
+        "each listener must report only the verbs it actually mounts"
+    );
+
+    ported_listener.shutdown().await;
+    default_listener.shutdown().await;
+}
+
+#[tokio::test]
+async fn declared_ports_reports_exactly_the_ports_the_listing_declares() {
+    // The helper is derived from the generated table, so it has to agree with the published
+    // listing to the row: `[8010]` here, and exactly one `port`-carrying row there with the same
+    // number. Asserted as an exact `Vec` (sorted and deduplicated by contract), never as `contains`.
+    assert_eq!(
+        declared_ports(),
+        vec![PORTED_HEALTH_PORT],
+        "the declared ports are not exactly the one group this build compiles in"
+    );
+
+    // The same fact read off the expected table: the rows that carry a `port`, deduplicated and
+    // sorted the way `declared_ports()` promises. A group that declares a port the listing does
+    // not show (or the reverse) fails here even if a router happens to serve it.
+    let mut from_listing: Vec<u16> = route_table()
+        .as_array()
+        .expect("the expected table is an array")
+        .iter()
+        .filter_map(|row| row.get("port").and_then(JsonValue::as_u64))
+        .map(|port| u16::try_from(port).expect("a declared port fits in u16"))
+        .collect();
+    from_listing.sort_unstable();
+    from_listing.dedup();
+    assert_eq!(
+        declared_ports(),
+        from_listing,
+        "`declared_ports()` and the published listing disagree"
+    );
+
+    // The default listener is `None`, not a port number, so it can never show up in this list -
+    // and neither can 0, which is the value a "no port" implementation would be tempted to use.
+    assert!(
+        !declared_ports().contains(&0),
+        "the default listener leaked into the declared ports: {:?}",
+        declared_ports()
+    );
 }

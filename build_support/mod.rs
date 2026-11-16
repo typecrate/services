@@ -18,12 +18,15 @@
 //!
 //! `$OUT_DIR/service_routes.rs` (see [`GENERATED_FILE_NAME`]) contains module-scope items
 //! only: one absolute `#[path]` module per discovered route file, then
-//! `pub fn register_routes(router: axum::Router<crate::server::AppState>) -> axum::Router<crate::server::AppState>`
+//! `pub fn register_routes(router: axum::Router<crate::server::AppState>, port: Option<u16>) -> axum::Router<crate::server::AppState>`
 //! and `pub fn route_metadata() -> Vec<crate::server::EndpointMeta>` (R3). The **crate root**
 //! includes it (`src/lib.rs`), which is the only place the include and the
 //! `crate::register_routes` call can be kept in step - the generated signatures use
 //! absolute `crate::server::AppState` paths, so the include location and the call path are
-//! a pair.
+//! a pair. `register_routes` takes the listener it is building (`None` = the default
+//! listener, `Some(N)` = the listener for port N) and hands it to every route module, so a
+//! route file can publish the same API path on more than one port; `route_metadata` is
+//! deliberately NOT filtered by port - the listing shows one row per `(method, path, port)`.
 //!
 //! ```text
 //! include!(concat!(env!("OUT_DIR"), "/service_routes.rs"));
@@ -43,22 +46,34 @@
 //! # Route file contract (what a discovered file must provide)
 //!
 //! One `crate::service_routes!` invocation ([`ROUTE_MACRO_PATH`], defined in
-//! `src/server/metadata.rs`) that lists the file's endpoints. The macro emits the two items
-//! the generator relies on, from the same entries:
+//! `src/server/metadata.rs`) that lists the file's endpoints: **path first, then a
+//! method-keyed group of handlers, then an optional `, port:`** - the structure of the
+//! TypeScript route contract (`{ route, handler: { VERB: fn }, port? }`,
+//! `packages/underload/service/src/server/{start.ts:183-210,handler.ts:31-46}`) restated in
+//! idiomatic macro notation. The macro emits the two items the generator relies on, from the
+//! same entries:
 //!
 //! ```text
 //! crate::service_routes! {
-//!     GET "/v1/services/health" => health, "Reports the service name and version";
+//!     "/v1/services/health" => {
+//!         GET: health, "Reports the service name and version";
+//!     };
 //! }
 //!
-//! // emits, from that one entry (abbreviated):
-//! pub fn register(router: ..) -> .. {
-//!     router.route("/v1/services/health", axum::routing::on(MethodFilter::GET, health))
+//! // emits, from that one group (abbreviated):
+//! pub fn register(router: .., port: Option<u16>) -> .. {
+//!     // the group declares no port, so it belongs to the default listener (`port == None`)
+//!     router.merge(if port == None {
+//!         Router::new().route("/v1/services/health", axum::routing::on(MethodFilter::GET, health))
+//!     } else {
+//!         Router::new()
+//!     })
 //! }
 //! pub const ENDPOINTS: &[crate::server::EndpointMeta] = &[EndpointMeta {
 //!     method: "GET",  // stringify! of the verb above, not a re-typed string
 //!     path: "/v1/services/health",
 //!     summary: "Reports the service name and version",
+//!     port: None,     // `Some(N)` when the group wrote `, port: N`
 //! }];
 //! ```
 //!
@@ -171,13 +186,17 @@ pub const DEFAULT_ROOT_ANCESTOR_STEPS: usize = 3;
 /// Name of the generated module inside `$OUT_DIR`.
 pub const GENERATED_FILE_NAME: &str = "service_routes.rs";
 
-/// Entry point emitted into the generated file.
+/// Entry point emitted into the generated file: `register_routes(router, port)`, where
+/// `port: Option<u16>` says which listener is being built (`None` = the default one) and each
+/// route module mounts only the groups that declare it.
 pub const GENERATED_FUNCTION: &str = "register_routes";
 
 /// Second crate-scope entry point emitted into the generated file (R3): the discovered
 /// endpoint listing, in the same module order as [`GENERATED_FUNCTION`]. Each row comes
 /// from a route module's [`ROUTE_ENDPOINTS_CONST`], i.e. from the same macro entries that
-/// built its `register` fn, so the listing cannot disagree with the router. The type it
+/// built its `register` fn, so the listing cannot disagree with the router. It is NOT
+/// filtered by port: one row per mounted `(method, path, port)`, so a path published on two
+/// listeners appears twice. The type it
 /// returns is `crate::server::EndpointMeta` (`src/server/metadata.rs`).
 pub const GENERATED_METADATA_FUNCTION: &str = "route_metadata";
 

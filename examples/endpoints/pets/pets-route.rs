@@ -14,8 +14,9 @@
 //! scanner ignores it and the resource is still discovered exactly once.
 //!
 //! All six endpoints are declared in the single `crate::service_routes!` invocation at the
-//! bottom of this file: the generated `register_routes` chains this module's `register` fn
-//! and the generated `route_metadata` concatenates this module's `ENDPOINTS`, so those
+//! bottom of this file: the generated `register_routes` chains this module's
+//! `register(router, port)` fn and the generated `route_metadata` concatenates this module's
+//! `ENDPOINTS`, so those
 //! entries are simultaneously the mount table and the playground listing (R3). Being compiled
 //! at all is the proof the scan reaches axum: a wrong verb, a wrong path or a wrong extractor
 //! signature is a compile error - on this file for the first two, on the core file for the
@@ -31,21 +32,28 @@ use handlers::remove;
 use handlers::replace;
 use handlers::update;
 
-// Route-file contract (`build_support/mod.rs`), one entry per mounted method+path pair.
-// Entry order is both the `.route()` chain order and the `ENDPOINTS` order, so the listing
-// reads top-down exactly like the table it describes. The collection path appears twice
-// (GET + POST) and the `{id}` path four times; axum merges the method routers of a path it
+// Route-file contract (`build_support/mod.rs`): one group per path, verbs inside the group.
+// Group order, and verb order inside a group, are both the `.route()` chain order AND the
+// `ENDPOINTS` order, so the listing reads top-down exactly like the table it describes. The
+// collection path appears once as a group with two verbs (GET + POST) and the `{id}` path once
+// as a group with four (GET, PUT, PATCH, DELETE); axum merges the method routers of a path it
 // has already seen, so the six entries below mount two path patterns - and the same
-// method+path twice would panic while the table is built, not silently override
-// (`src/server/metadata.rs`). None of these paths is one of the four reserved built-ins
+// verb+path twice on one port would panic while the table is built, not silently override
+// (`src/server/metadata.rs`). Each verb keeps its own summary, because each verb is its own
+// listing row. None of these paths is one of the four reserved built-ins
 // (`/`, `/playground.css`, `/playground.js`, `/v1/services/routes`), so nothing here collides
 // with `src/server/mod.rs` when `app()` runs. Every handler name resolves through the `use`
 // lines above, because the macro expands in this module.
 crate::service_routes! {
-    GET "/v1/services/pets" => list, "Lists every stored pet";
-    POST "/v1/services/pets" => create, "Creates a pet and answers 201 with it";
-    GET "/v1/services/pets/{id}" => find, "Returns one pet by id, or 404 when the id is unknown";
-    PUT "/v1/services/pets/{id}" => replace, "Replaces one pet by id, or 404 when the id is unknown";
-    PATCH "/v1/services/pets/{id}" => update, "Updates only the sent fields of one pet, or 404 when the id is unknown";
-    DELETE "/v1/services/pets/{id}" => remove, "Removes one pet by id and answers 204, or 404 when the id is unknown";
+    "/v1/services/pets" => {
+        GET: list, "Lists every stored pet";
+        POST: create, "Creates a pet and answers 201 with it";
+    };
+
+    "/v1/services/pets/{id}" => {
+        GET: find, "Returns one pet by id, or 404 when the id is unknown";
+        PUT: replace, "Replaces one pet by id, or 404 when the id is unknown";
+        PATCH: update, "Updates only the sent fields of one pet, or 404 when the id is unknown";
+        DELETE: remove, "Removes one pet by id and answers 204, or 404 when the id is unknown";
+    };
 }

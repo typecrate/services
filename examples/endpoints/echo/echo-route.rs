@@ -10,13 +10,15 @@
 //! hardcodes it; the core file beside this one has no identifier at all, because the scanner
 //! never sees its name.
 //!
-//! Both HTTP methods of one resource are declared here, in one block: repeating a path with a
-//! *different* verb is the intended spelling (axum merges the two method routers). Being
+//! Both HTTP methods of one resource are declared here, in one invocation - each under its own
+//! path, with its verb inside that path's handler group: the path-first, verb-grouped shape is
+//! the structure of the TypeScript route contract (`{ route, handler: { VERB: fn }, port? }`),
+//! restated in macro notation. Being
 //! compiled at all is the proof the build-time scan reaches axum - a wrong verb or a wrong
 //! path literal is a compile error on this file, never a runtime failure. The generated
-//! `register_routes` chains this module's `register` fn and the generated `route_metadata`
-//! concatenates this module's `ENDPOINTS`, so the two entries below are simultaneously the
-//! mount table and the playground listing (R3).
+//! `register_routes` chains this module's `register(router, port)` fn and the generated
+//! `route_metadata` concatenates this module's `ENDPOINTS`, so the two entries below are
+//! simultaneously the mount table and the playground listing (R3).
 
 #[path = "echo-core.rs"]
 mod handlers;
@@ -24,15 +26,22 @@ mod handlers;
 use handlers::echo_json;
 use handlers::echo_path;
 
-// Route-file contract (`build_support/mod.rs`), one entry per mounted method+path pair.
-// Entry order is both the `.route()` chain order and the `ENDPOINTS` order, so the listing
-// reads top-down exactly like the table it describes. Two entries sharing one path with
-// different methods are fine (axum merges the method routers); the same method+path twice
-// is an axum panic while the table is built. `{value}` is part of the listed path, so the
-// playground shows the pattern, not a sample URL (`src/server/metadata.rs`). Both handler
-// names resolve through the `use` lines above: the macro expands in this module, which is
-// where those names are in scope, not in the core file.
+// Route-file contract (`build_support/mod.rs`): each group writes its path first and its
+// verbs inside the `{}` handler group, one line per mounted method. Group order, and verb
+// order inside a group, are both the `.route()` chain order AND the `ENDPOINTS` order, so the
+// listing reads top-down exactly like the table it describes. `POST` is written first on
+// purpose: it is the written order that is load-bearing, not an alphabetical one. Two groups
+// sharing one path with different verbs are fine (axum merges the method routers); the same
+// verb+path twice on one port is an axum panic while the table is built. `{value}` is part of
+// the listed path, so the playground shows the pattern, not a sample URL
+// (`src/server/metadata.rs`). Both handler names resolve through the `use` lines above: the
+// macro expands in this module, which is where those names are in scope, not in the core file.
 crate::service_routes! {
-    POST "/v1/services/echo" => echo_json, "Echoes the posted `value` unchanged";
-    GET "/v1/services/echo/{value}" => echo_path, "Echoes `{value}`, with `?prefix=` applied";
+    "/v1/services/echo" => {
+        POST: echo_json, "Echoes the posted `value` unchanged";
+    };
+
+    "/v1/services/echo/{value}" => {
+        GET: echo_path, "Echoes `{value}`, with `?prefix=` applied";
+    };
 }

@@ -55,8 +55,9 @@ fn header(report: &ScanReport) -> String {
         "// those slices in the order above, so the endpoint listing is the router - never a"
             .to_owned(),
         "// second table. Built-in routes in `src/server` are not part of it, and an".to_owned(),
-        "// `EndpointMeta` row holds method/path/summary only: no scan root, no `#[path]`."
+        "// `EndpointMeta` row holds method/path/summary (plus `port` when the group declared"
             .to_owned(),
+        "// one): no scan root, no `#[path]`.".to_owned(),
     ];
     // The per-route map: what a reader of this file needs to connect a path on disk with the
     // identifier the declarations below use (and with `<identifier>::ENDPOINTS` in
@@ -105,13 +106,28 @@ pub fn generate_module(report: &ScanReport) -> String {
         ));
     }
     generated.push_str(
-        "/// Registers every discovered service route onto `router`, in the order listed above.\n",
+        "/// Registers the discovered service routes that belong to `port` onto `router`,\n",
     );
     // Split rather than one big literal: a multi-line literal would need `\<space>`
     // gymnastics to keep the 4-space indentation after a line continuation.
+    generated.push_str("/// in the order listed above.\n");
+    generated.push_str("///\n");
+    generated.push_str(
+        "/// `port` is the listener being built: `None` is the default listener, `Some(N)` is\n",
+    );
+    generated.push_str(
+        "/// the listener for port N. Each route module filters per group, because a group of\n",
+    );
+    generated.push_str(
+        "/// `crate::service_routes!` carries an optional `, port:` trailer - so one route file\n",
+    );
+    generated.push_str(
+        "/// can publish the same API path on two ports without either declaration overriding\n",
+    );
+    generated.push_str("/// the other.\n");
     generated.push_str("pub fn ");
     generated.push_str(GENERATED_FUNCTION);
-    generated.push_str("(\n    router: axum::Router<crate::server::AppState>,\n) -> axum::Router<crate::server::AppState> {\n");
+    generated.push_str("(\n    router: axum::Router<crate::server::AppState>,\n    port: Option<u16>,\n) -> axum::Router<crate::server::AppState> {\n");
 
     // The chain ends with a CALL, not with a bare binding. `let router = ...; router` is
     // `clippy::let_and_return`, and the generated file is `include!`d into the crate, so
@@ -121,18 +137,29 @@ pub fn generate_module(report: &ScanReport) -> String {
     let last = report.routes.len();
     for (index, route) in report.routes.iter().enumerate() {
         if index + 1 == last {
-            generated.push_str(&format!("    {}::register(router)\n", route.module_name));
+            generated.push_str(&format!(
+                "    {}::register(router, port)\n",
+                route.module_name
+            ));
         } else {
             generated.push_str(&format!(
-                "    let router = {}::register(router);\n",
+                "    let router = {}::register(router, port);\n",
                 route.module_name
             ));
         }
     }
     // With zero routes the body is just the identity, which keeps the host compiling
     // (an empty tree is legal; `build.rs` warns about it instead). `router` here is the
-    // PARAMETER, so the let_and_return lint above cannot fire.
+    // PARAMETER, so the let_and_return lint above cannot fire. `port` has to be named-and-
+    // dropped: the signature is the contract and does not shrink with the tree, and an
+    // unused parameter would be an `unused_variables` warning under `-D warnings`.
     if last == 0 {
+        generated.push_str(
+            "    // No discovered route file, so no listener filter to apply; the signature\n",
+        );
+        generated
+            .push_str("    // still names `port`, and naming it here is what keeps it used.\n");
+        generated.push_str("    let _ = port;\n");
         generated.push_str("    router\n");
     }
     generated.push_str("}\n");

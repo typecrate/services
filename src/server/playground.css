@@ -527,6 +527,25 @@ body {
     overflow-wrap: anywhere;
 }
 
+/* A declared port names the LISTENER a row belongs to, and one API path can be published on more
+   than one listener at once, so the rail needs the number to tell two same-path rows apart. It is
+   its own marker rather than text appended to the path because a port is never part of the URL -
+   the row keeps showing the path it actually requests. `playground.js` creates this node ONLY for a
+   row that declared a port, so an unported row is still badge + path + summary, unchanged. The
+   neutral chip palette is deliberate: an accent fill would disappear inside the `aria-current`
+   background above. */
+.endpoint-port {
+    grid-column: 2;
+    justify-self: start;
+    padding: 1px 6px;
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    background: var(--panel-alt);
+    color: var(--text-soft);
+    font: 600 11px/1.5 var(--mono);
+    letter-spacing: 0.04em;
+}
+
 .badge {
     grid-row: 1 / span 2;
     align-self: start;

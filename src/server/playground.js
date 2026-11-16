@@ -15,6 +15,14 @@
  *     a relative absolute-path string built from a validated template, and
  *     `mode: "same-origin"` + `redirect: "error"` mean a cross-origin answer or
  *     any redirect fails loudly instead of leaving the page's origin.
+ *   * A consequence of that rule, stated where a reader would otherwise be misled:
+ *     a listing row that declares a port (`"port": 8010`) names a listener this page
+ *     CANNOT reach, because the page itself is served only by the default listener
+ *     (`src/server/mod.rs::app_for`). Selecting such a row therefore says, in the
+ *     composer's state line, that Send dispatches on this origin - the row's marker
+ *     names the listener the route was DECLARED for, not the one that answers.
+ *     Cross-origin fetching is deliberately not implemented (no second origin in the
+ *     CSP), so honesty here is wording rather than transport.
  *   * Nothing destructive is sent automatically. The only load-time request is
  *     the `GET` endpoint listing; a body is only sent when the user presses
  *     Send, and the HTTP method always comes from the listing (never typed).
@@ -307,7 +315,30 @@
                 rejected.push('Entry ' + index + ' has a path this page will not request: "' + path + '".');
                 return;
             }
-            entries.push({ method: method, path: path, summary: summary });
+            // `port` is OPTIONAL metadata naming WHICH LISTENER the group was mounted on (the
+            // listing omits the key entirely for a group that declared none). It is never part of
+            // the URL, so the page only ever uses it to label a row - the request still goes to
+            // this origin and this path. Anything that is not a real listener number is reported
+            // and then treated as "no declared port": a row must never claim a listener the
+            // listing did not actually declare, and a display-only detail must not delete a row
+            // that is otherwise perfectly requestable.
+            var port = null;
+            if (raw.port !== undefined && raw.port !== null) {
+                if (typeof raw.port === "number" && Math.floor(raw.port) === raw.port && raw.port >= 1 && raw.port <= 65535) {
+                    port = raw.port;
+                } else if (typeof raw.port === "number") {
+                    rejected.push("Entry " + index + " declares a port outside 1-65535: " + raw.port + ".");
+                } else {
+                    // Only the kind is quoted, never the value: it is server text and could be any shape.
+                    rejected.push("Entry " + index + " declares a port that is not a number (" + typeof raw.port + ").");
+                }
+            }
+            // `id` is the row's index in the listing, and it is what makes a row addressable: the
+            // same `method` + `path` legitimately appears once per listener, so that pair cannot
+            // identify one row. The listing is rebuilt only by a (re)load, and selection is always
+            // re-derived from the freshly parsed array, so the index stays stable for the rows on
+            // screen and can never point at a row that no longer exists.
+            entries.push({ id: index, method: method, path: path, summary: summary, port: port });
         });
         return { entries: entries, rejected: rejected };
     }
@@ -394,7 +425,10 @@
             var button = document.createElement("button");
             button.type = "button";
             button.className = "endpoint";
-            if (state.selected && state.selected.path === entry.path && state.selected.method === entry.method) {
+            // The row id, never `method` + `path`: one API path can be declared on several
+            // listeners, and then exactly ONE of those rows is the selected one. Comparing the
+            // pair used to light up every listener of a duplicated path at once.
+            if (state.selected && state.selected.id === entry.id) {
                 button.setAttribute("aria-current", "true");
             }
 
@@ -415,11 +449,31 @@
 
             button.appendChild(badge);
             button.appendChild(path);
+
+            // The listener marker, and it exists only for a row that declared a port: for every
+            // other row "no marker" IS the statement "default listener", so those rows render
+            // byte-for-byte as they did before the port slot existed. The port is a number this
+            // page validated in `normaliseEntries`, and it is still only ever set as text.
+            if (entry.port !== null) {
+                var port = document.createElement("span");
+                port.className = "endpoint-port";
+                text(port, "port " + entry.port);
+                button.appendChild(port);
+            }
+
             button.appendChild(summary);
-            button.setAttribute(
-                "aria-label",
-                "Use " + entry.method + " " + entry.path + (entry.summary ? " - " + entry.summary : "")
-            );
+
+            // The accessible name names the listener for the same reason the marker does: the
+            // visible badge and path are shared by every listener of a duplicated path, and a
+            // screen reader walking the rail only ever hears this string.
+            var label = "Use " + entry.method + " " + entry.path;
+            if (entry.port !== null) {
+                label += " on port " + entry.port;
+            }
+            if (entry.summary) {
+                label += " - " + entry.summary;
+            }
+            button.setAttribute("aria-label", label);
             // Closure over `entry` (not an index): filtering changes indexes.
             button.addEventListener("click", function () {
                 selectEntry(entry);
@@ -487,11 +541,41 @@
 
         show(ui.form, true);
         ui.send.disabled = false;
-        setState(ui.composerState, "", null);
+
+        // WHERE THE REQUEST ACTUALLY GOES (the ported-row honesty rule).
+        //
+        // A row that declared `, port: N` names a listener of its own, but this page cannot reach
+        // that listener: the four builtins are mounted on the DEFAULT listener only
+        // (`src/server/mod.rs::app_for`, the `if port.is_none()` branch), so the document and this
+        // script always come from it, and every request is built as a path on `location.origin`
+        // with `mode: "same-origin"` (`buildRequest`/`sendRequest`). Pressing Send on a ported row
+        // is therefore answered by the listener that served the page, never by port N - the marker
+        // in the rail says which listener the ROW was declared for, which is not the same fact.
+        //
+        // The state line is the slot that carries this: it already exists (`#composer-state`,
+        // `role="status"`), so no markup, stylesheet or placeholder text changes. `entry.method`
+        // and `entry.path` are the listing's own text and `entry.port` is the number
+        // `normaliseEntries` validated, and everything below goes in through `text()`.
+        //
+        // An UNPORTED row still gets an empty state line: for it "this origin" and "the declared
+        // listener" are the same listener, so silence is not misleading and those rows stay
+        // byte-for-byte what they were before the port slot existed.
+        var target = entry.method + " " + entry.path;
+        if (entry.port === null) {
+            setState(ui.composerState, "", null);
+        } else {
+            setState(
+                ui.composerState,
+                "Port " + entry.port + " is a separate listener, and this page can only ask the " +
+                    "origin that served it: Send dispatches " + target + " on this origin, never on port " + entry.port + ".",
+                null
+            );
+        }
+
         ui.method.value = entry.method;
         ui.path.value = entry.path;
         text(ui.summary, entry.summary || "");
-        text(ui.composerTarget, entry.method + " " + entry.path);
+        text(ui.composerTarget, target);
 
         buildParamRows(entry.path);
 

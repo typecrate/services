@@ -21,7 +21,7 @@
 //! What IS pinned for R3 (T17): the generated `route_metadata` item byte for byte, in every
 //! tree shape (multiple routes, zero routes, identifiers that need the snake-case allow), and
 //! that it names the SAME module identifiers in the SAME order as `register_routes`. The
-//! method/path/summary *values* are deliberately out of reach here: the scanner never opens
+//! method/path/summary/port *values* are deliberately out of reach here: the scanner never opens
 //! a route file, so those values come from each file's `crate::service_routes!` invocation
 //! (`src/server/metadata.rs`), where one token feeds both the mount and the listing -
 //! a compile-time property checked by that macro's own unit tests, not by a filesystem walk.
@@ -68,7 +68,7 @@ use build_support::types::ScanReport;
 /// Body of every fixture route file: contents are irrelevant to discovery (the scanner
 /// never reads route files), but a real file has to exist on disk. This is also why the R3
 /// listing cannot come from a scan: with contents unread, the only trustworthy source of a
-/// route file's methods and paths is the file's own `crate::service_routes!` expansion
+/// route file's methods, paths and ports is the file's own `crate::service_routes!` expansion
 /// (`src/server/metadata.rs`), which the generated `route_metadata` merely concatenates.
 const FIXTURE_ROUTE: &str = "// fixture route\n";
 
@@ -167,10 +167,48 @@ fn route_summaries(report: &ScanReport) -> Vec<String> {
 
 /// Start of the generated registration item (its doc comment), used to slice the emitted
 /// text without depending on the human-readable header above it.
-const REGISTER_MARKER: &str = "/// Registers every discovered service route";
+///
+/// The first sentence changed in T6: `register_routes` now takes the listener it is
+/// building, so the doc comment says which routes it registers. The marker is only a slice
+/// point - the byte expectations below pin the whole doc comment via [`REGISTER_DOC`].
+const REGISTER_MARKER: &str = "/// Registers the discovered service routes";
 
 /// Start of the generated endpoint-listing item (R3), the second slice point.
 const METADATA_MARKER: &str = "/// Metadata for every discovered service route";
+
+/// The doc comment `emit.rs` writes above `register_routes`, byte for byte. Shared by the
+/// three byte-pinned bodies below so the port contract is stated exactly once: `port` is
+/// the listener being built (`None` = the default one), and a route module filters per
+/// `crate::service_routes!` group. `concat!` rather than one multi-line literal keeps the
+/// 4-space indentation of the emitted text out of the escaping rules (`\`-continuations
+/// strip leading whitespace on the next line, which is why the older literals below spell
+/// leading spaces as `\x20`).
+const REGISTER_DOC: &str = concat!(
+    "/// Registers the discovered service routes that belong to `port` onto `router`,\n",
+    "/// in the order listed above.\n",
+    "///\n",
+    "/// `port` is the listener being built: `None` is the default listener, `Some(N)` is\n",
+    "/// the listener for port N. Each route module filters per group, because a group of\n",
+    "/// `crate::service_routes!` carries an optional `, port:` trailer - so one route file\n",
+    "/// can publish the same API path on two ports without either declaration overriding\n",
+    "/// the other.\n",
+);
+
+/// The `register_routes` signature `emit.rs` writes, byte for byte. The `port: Option<u16>`
+/// parameter is part of the contract the server module calls (`src/server/mod.rs`), and it
+/// is emitted even for a zero-route tree - the signature never shrinks with the tree.
+const REGISTER_SIGNATURE: &str = concat!(
+    "pub fn register_routes(\n",
+    "    router: axum::Router<crate::server::AppState>,\n",
+    "    port: Option<u16>,\n",
+    ") -> axum::Router<crate::server::AppState> {\n",
+);
+
+/// The suffix that follows a module identifier in the registration chain. It carries `, port`
+/// because every link of the chain hands the listener down (T6); `referenced_modules` reads
+/// the identifiers out of the emitted text, so this string must track the emitted call shape
+/// exactly or the chain assertions below silently list nothing.
+const REGISTER_NEEDLE: &str = "::register(router, port)";
 
 /// The `register_routes` item: from its doc comment up to the `route_metadata` item, i.e.
 /// exactly what T10's server module calls, plus the blank line `emit.rs` writes between the
@@ -197,7 +235,7 @@ fn generated_metadata(generated: &str) -> &str {
 
 /// The module identifiers a generated section refers to, in the order it refers to them.
 ///
-/// `needle` is the suffix that follows an identifier (`"::register(router)"` in the chain,
+/// `needle` is the suffix that follows an identifier (`[REGISTER_NEEDLE]` in the chain,
 /// `"::ENDPOINTS"` in the listing). Scanning backwards to the first non-identifier character
 /// keeps this a *reader* of the emitted text, not a reimplementation of the generator: it
 /// only answers "which identifiers appear, in which order".
@@ -768,14 +806,16 @@ fn discovery_order_and_generated_bytes_are_deterministic() {
     );
     assert_eq!(
         generated_body(&generated),
-        "/// Registers every discovered service route onto `router`, in the order listed above.\n\
-         pub fn register_routes(\n\
-         \x20   router: axum::Router<crate::server::AppState>,\n\
-         ) -> axum::Router<crate::server::AppState> {\n\
-         \x20   let router = endpoints_echo_echo_route::register(router);\n\
-         \x20   let router = endpoints_health_health_route::register(router);\n\
-         \x20   endpoints_metrics_metrics_route::register(router)\n\
-         }\n\n"
+        format!(
+            "{REGISTER_DOC}{REGISTER_SIGNATURE}{}",
+            concat!(
+                "    let router = endpoints_echo_echo_route::register(router, port);\n",
+                "    let router = endpoints_health_health_route::register(router, port);\n",
+                "    endpoints_metrics_metrics_route::register(router, port)\n",
+                "}\n\n",
+            )
+        ),
+        "every link of the chain must forward the listener it was handed"
     );
     // R3: the companion listing, byte for byte, including the separator blank line above it
     // (part of `generated_body`) and the fact that it references the three modules in the
@@ -816,6 +856,13 @@ fn discovery_order_and_generated_bytes_are_deterministic() {
     assert!(generated.contains(
         "// `pub const ENDPOINTS` from the same entries. `route_metadata` below concatenates"
     ));
+    // The listing shape, stated where it is generated: a row is method/path/summary, and the
+    // ONLY thing a `, port:` trailer adds is a `port` key. Pinned as two full lines because
+    // `tests/server_http.rs` asserts exactly this per-row JSON shape.
+    assert!(generated.contains(
+        "// `EndpointMeta` row holds method/path/summary (plus `port` when the group declared"
+    ));
+    assert!(generated.contains("// one): no scan root, no `#[path]`."));
     assert!(generated.contains("// Discovered route file -> generated module identifier:"));
     // The path -> identifier map, one line per discovered file: this is what a reader of the
     // generated file uses to find the module behind a `*-route.rs`, so the `-route` half of
@@ -856,12 +903,18 @@ fn an_empty_tree_still_generates_an_identity_router_and_an_empty_listing() {
     assert_eq!(fixture.watch(), Vec::<String>::new());
     assert_eq!(
         generated_body(&generate_module(&report)),
-        "/// Registers every discovered service route onto `router`, in the order listed above.\n\
-         pub fn register_routes(\n\
-         \x20   router: axum::Router<crate::server::AppState>,\n\
-         ) -> axum::Router<crate::server::AppState> {\n\
-         \x20   router\n\
-         }\n\n"
+        format!(
+            "{REGISTER_DOC}{REGISTER_SIGNATURE}{}",
+            concat!(
+                "    // No discovered route file, so no listener filter to apply; the signature\n",
+                "    // still names `port`, and naming it here is what keeps it used.\n",
+                "    let _ = port;\n",
+                "    router\n",
+                "}\n\n",
+            )
+        ),
+        "a zero-route tree keeps the two-parameter signature and names `port`, so an unused \
+         parameter cannot fail `-D warnings`"
     );
     // R3 with ZERO modules: the listing still exists, still returns the contract type, and
     // its array literal is empty - so an empty tree keeps the whole host compiling with no
@@ -912,7 +965,7 @@ fn the_generated_endpoint_listing_names_the_same_modules_in_the_same_order() {
         "endpoints_health_health_route",
     ];
     assert_eq!(
-        referenced_modules(generated_body(&generated), "::register(router)"),
+        referenced_modules(generated_body(&generated), REGISTER_NEEDLE),
         modules
     );
     // The listing side must name `ENDPOINTS` through the same contract constant the
@@ -1077,9 +1130,9 @@ fn the_harness_bridge_in_another_package_is_discovered_and_registered() {
         .map(|route| route.module_name.as_str())
         .collect();
     assert_eq!(
-        referenced_modules(generated_body(&generated), "::register(router)"),
+        referenced_modules(generated_body(&generated), REGISTER_NEEDLE),
         expected,
-        "`register_routes` must chain every discovered module, in order"
+        "`register_routes` must chain every discovered module, in order, forwarding the listener"
     );
     assert_eq!(
         referenced_modules(generated_metadata(&generated), "::ENDPOINTS"),
@@ -1265,15 +1318,16 @@ fn digit_and_unicode_route_paths_generate_declarations_the_strict_lint_accepts()
     // definition, never at a use path (probe #1 emitted exactly one diagnostic per `mod`).
     assert_eq!(
         generated_body(&generated),
-        "/// Registers every discovered service route onto `router`, in the order listed above.\n\
-         pub fn register_routes(\n\
-         \x20   router: axum::Router<crate::server::AppState>,\n\
-         ) -> axum::Router<crate::server::AppState> {\n\
-         \x20   let router = endpoints__2024_service_route::register(router);\n\
-         \x20   let router = endpoints_Unicode_service_route::register(router);\n\
-         \x20   let router = endpoints_health_service_route::register(router);\n\
-         \x20   endpoints__n_code_service_route::register(router)\n\
-         }\n\n"
+        format!(
+            "{REGISTER_DOC}{REGISTER_SIGNATURE}{}",
+            concat!(
+                "    let router = endpoints__2024_service_route::register(router, port);\n",
+                "    let router = endpoints_Unicode_service_route::register(router, port);\n",
+                "    let router = endpoints_health_service_route::register(router, port);\n",
+                "    endpoints__n_code_service_route::register(router, port)\n",
+                "}\n\n",
+            )
+        )
     );
     // R3: the listing carries the same hostile identifiers (`_`-prefixed digit segment,
     // capitals, and the `_n_code` sanitising of non-ASCII) and needs no allow of its own -

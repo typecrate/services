@@ -2,13 +2,25 @@
 //!
 //! This is the thinnest possible process wrapper around the library: it turns
 //! CLI/env configuration into an `AppState` and serves
-//! `typecrate_services::server::app(state)` on a tokio listener. The route table is
-//! NOT assembled here - `server::app` pulls in the build-time generated registration
-//! (see `src/lib.rs`), so a test that serves `app(state)` and this process serve
-//! literally the same router.
+//! `typecrate_services::server::app_for(port, state)` on one tokio listener per port.
+//! The route table is NOT assembled here - `server::app_for` pulls in the build-time
+//! generated registration (see `src/lib.rs`), so a test that serves `app(state)` and
+//! this process' default listener serve literally the same router.
+//!
+//! HOW MANY LISTENERS: one for the default address (`--addr`/`--port`/env, built-in
+//! `0.0.0.0:8000`), plus one per port a route file declared with the trailing `port:`
+//! slot of `crate::service_routes!`. That set is DERIVED from the compiled-in route
+//! table (`server::declared_ports()`), never configured, so a declared port cannot end
+//! up without a listener and a listener cannot exist for a port nothing declares. Each
+//! one reuses the resolved host and overrides only the port, and each serves only the
+//! groups that declared it (`server::app_for`), which is what lets the same API path be
+//! published on two ports without either declaration overriding the other. A build
+//! whose route files declare no port binds exactly one listener, prints exactly the
+//! banner it printed before route ports existed, and serves exactly what `app(state)`
+//! is.
 //!
 //! The one policy that lives here rather than in the library is *where the process
-//! listens*: the built-in bind is `0.0.0.0:5001` (every interface, LAN-reachable, the
+//! listens*: the built-in bind is `0.0.0.0:8000` (every interface, LAN-reachable, the
 //! same surface the TS gateway publishes), with `--addr 127.0.0.1` as the opt-in
 //! loopback start. The banner therefore never prints the bind answer (`0.0.0.0`) as a
 //! URL - it prints loopback URLs for this machine plus a detected LAN URL, and says
@@ -24,8 +36,11 @@ mod native {
     use std::path::{Path, PathBuf};
 
     use tokio::net::TcpListener;
+    use tokio::sync::watch;
+    use tokio::task::JoinSet;
     use typecrate_services::server::{
-        AppState, MAX_REQUEST_BODY_BYTES, app, default_database_root, normalize_lexically,
+        AppState, MAX_REQUEST_BODY_BYTES, app_for, declared_ports, default_database_root,
+        normalize_lexically,
     };
 
     /// Exit code for a clean Ctrl+C/SIGTERM shutdown.
@@ -43,12 +58,18 @@ mod native {
 
     /// Default bind: every interface on the documented port, i.e. the same public
     /// surface the TS gateway (`0.0.0.0`) has, so an unconfigured native start is
-    /// reachable from other devices on the LAN. 5001 is the port this package
+    /// reachable from other devices on the LAN. 8000 is the port this package
     /// documents; if something already holds it the process says so and exits - it
     /// does not kill anybody. Loopback stays available as an explicit opt-in
     /// (`--addr 127.0.0.1`), which is the right choice on a public or untrusted
     /// network because this server has no auth and no CORS gate yet.
-    const DEFAULT_ADDR: &str = "0.0.0.0:5001";
+    ///
+    /// This is the DEFAULT listener only. A route file may declare a port of its own,
+    /// and each distinct declaration is bound as a separate listener on the same host
+    /// (`serve`); the set is derived from the route table, so it is not something this
+    /// constant or a flag can list. A declaration that names THIS port is a startup
+    /// error - see `check_declared_port_collisions`.
+    const DEFAULT_ADDR: &str = "0.0.0.0:8000";
 
     /// Framework builtins served by `server::app` (`src/server/mod.rs`): the
     /// interactive playground at the root, and the JSON listing of the compiled-in
@@ -58,6 +79,10 @@ mod native {
     /// `server::PLAYGROUND_STYLES_PATH` / `server::PLAYGROUND_SCRIPT_PATH`) are reserved
     /// the same way - spelled out in `HELP` below, but not needed by the banner, which
     /// only prints navigable pages.
+    ///
+    /// They are mounted on the DEFAULT listener only (`app_for(None, ..)`), so the two
+    /// URLs below exist on the default port alone - an extra listener a route file
+    /// declared serves just the API paths that asked for it, and 404s these four.
     const PLAYGROUND_PATH: &str = "/";
     const ROUTE_LISTING_PATH: &str = "/v1/services/routes";
 
@@ -70,9 +95,9 @@ USAGE:
 
 OPTIONS:
     -a, --addr <ip[:port]>   Bind address, numeric IPv4 or IPv6; an IPv6 address is
-                             written in brackets ([::1] or [::1]:5001 - the port may
+                             written in brackets ([::1] or [::1]:8000 - the port may
                              be left off, see below).
-                             Default 0.0.0.0:5001 - every interface, so other
+                             Default 0.0.0.0:8000 - every interface, so other
                              devices on the LAN can reach it. Pass
                              --addr 127.0.0.1 for a loopback-only start. A bare ip
                              keeps the currently selected port.
@@ -92,7 +117,7 @@ ENVIRONMENT:
 Precedence per setting: CLI flag, then environment variable, then built-in default.
 Exit codes: 0 clean shutdown, 1 could not serve, 2 bad usage.
 
-WHERE IT ANSWERS (framework builtins, not endpoint routes):
+WHERE IT ANSWERS (framework builtins of the DEFAULT listener, not endpoint routes):
     GET /                     interactive playground, served from the same origin
                               with no external assets - open this on the machine
                               running the server.
@@ -102,7 +127,9 @@ WHERE IT ANSWERS (framework builtins, not endpoint routes):
                               (method, path, summary), the same set the playground
                               offers.
     These four paths are reserved: an endpoint file must not register any of them, and
-    one that does makes the router panic at startup instead of shadowing a builtin.
+    one that does makes the router panic at startup instead of shadowing a builtin. A
+    group that declares a port of its own is not checked against them, because those
+    four are not mounted on a declared listener at all.
     On this machine use http://127.0.0.1:<port>/ ; 0.0.0.0 is a bind answer, not a
     URL. From another device use http://<this machine's LAN ip>:<port>/ - the startup
     banner prints the address it detected. Binding is only half of reachability:
@@ -110,11 +137,26 @@ WHERE IT ANSWERS (framework builtins, not endpoint routes):
     connections on that port too, so the first start may need a permission prompt
     accepted (nothing here changes the firewall or any global network setting).
 
+    PORTS A ROUTE FILE DECLARES:
+    A route file may name a listener of its own with the trailing `port:` slot of
+    `crate::service_routes!`. Every DISTINCT declared port gets its OWN listener at
+    startup, bound on the ip --addr/env resolved with only the port replaced - so
+    --addr 127.0.0.1 isolates the declared ports exactly like it isolates the default
+    one. There is no flag for them: the set is read from the compiled-in route table,
+    and each listener serves only the paths that declared it. The same API path may be
+    declared on two ports, and it is then served on both, independently - neither
+    declaration overrides the other. The playground, its two assets and the route
+    listing belong to the DEFAULT listener and answer 404 on a declared one, and a path
+    that did not declare a port answers 404 on the declared listener. A route file that
+    declares the port this process binds stops the start with exit 1 and names the port
+    to move, because two listeners cannot share one socket. The startup banner lists
+    every listener this process bound.
+
     PARALLEL INSTANCES:
     A start fails with exit 1 only when THAT address and port are already bound, and
     nothing is ever killed. On Windows a bind to a specific address can still succeed
     beside a listener already holding the wildcard on the same port (e.g. this process
-    on 127.0.0.1:5001 while another owns 0.0.0.0:5001), and the more specific socket
+    on 127.0.0.1:8000 while another owns 0.0.0.0:8000), and the more specific socket
     then wins the connections for that interface, so the older server keeps the LAN and
     this one serves loopback. Run parallel instances on distinct --port values unless
     that shadowing is what you want.
@@ -314,7 +356,7 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
         Ok(PathBuf::from(raw.as_os_str()))
     }
 
-    /// Accepts `ip:port` (also `[::1]:5001`) and a bare host - `127.0.0.1`, `0.0.0.0`
+    /// Accepts `ip:port` (also `[::1]:8000`) and a bare host - `127.0.0.1`, `0.0.0.0`
     /// or the bracketed IPv6 form `[::1]` - by re-attaching the port already selected.
     /// The bracketed form is the CLI/URL spelling of an IPv6 host, so `[::1]` is a host
     /// and not a malformed `host:port`; stripping the brackets is what lets the same
@@ -407,7 +449,7 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
 
     /// `http://<ip>:<port><path>`. Rebuilding a `SocketAddr` rather than pasting the
     /// ip is what makes an IPv6 URL correct: `SocketAddr`'s `Display` brackets it,
-    /// which `http://::1:5001/` would not be.
+    /// which `http://::1:8000/` would not be.
     fn url_for(ip: IpAddr, port: u16, path: &str) -> String {
         let address = SocketAddr::new(ip, port);
         format!("http://{address}{path}")
@@ -509,13 +551,138 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
         lines
     }
 
+    /// Startup check: does a route file declare the very port this process binds?
+    ///
+    /// A route port and the default port are two SEPARATE listeners on two sockets, so a
+    /// clash is not something the process can negotiate - the second bind would refuse and
+    /// the operator would read "address already in use" as if some other program owned the
+    /// port. Naming the declaration is what makes the failure fixable (move the default
+    /// with `--port`, or move the route), and running this BEFORE the first bind is what
+    /// keeps the process from leaving one listener up while the other one failed.
+    ///
+    /// Pure and it returns a `String` rather than panicking: `profile.release` sets
+    /// `panic = "abort"`, so a panic here would be an abort status instead of the promised
+    /// exit 1, and the caller turns the message into stderr with no backtrace.
+    fn check_declared_port_collisions(default: SocketAddr, declared: &[u16]) -> Result<(), String> {
+        let port = default.port();
+        if declared.contains(&port) {
+            return Err(format!(
+                "a route file declares port {port} and this process binds {default}, so both \
+                 listeners want the same socket. They are separate listeners and neither \
+                 shares it: move the default with --port <other> (or change the declaration). \
+                 Nothing was bound."
+            ));
+        }
+        Ok(())
+    }
+
+    /// Binds the listener for ONE declared port: the host this process resolved is reused
+    /// verbatim and only the port is overridden, so `--addr 127.0.0.1` isolates the
+    /// declared ports exactly like it isolates the default one, and a LAN bind publishes
+    /// them on the LAN too.
+    async fn bind_declared_listener(default: SocketAddr, port: u16) -> Result<TcpListener, String> {
+        let addr = SocketAddr::new(default.ip(), port);
+        match TcpListener::bind(addr).await {
+            Ok(listener) => Ok(listener),
+            Err(err) if err.kind() == ErrorKind::AddrInUse => Err(format!(
+                "cannot bind {addr} - the listener a route file declared for port {port}, and \
+                 the address is already in use. Nothing was killed; free the port or change \
+                 the declaration."
+            )),
+            Err(err) => Err(format!(
+                "cannot bind {addr} - the listener a route file declared for port {port}: {err}"
+            )),
+        }
+    }
+
+    /// The `METHOD /path` rows the route files declared for `port`, for the banner line.
+    ///
+    /// Same generated table `server::declared_ports()` derives the listener set from, so
+    /// the banner cannot advertise a path the listener does not serve.
+    fn declared_routes_for_port(port: u16) -> Vec<String> {
+        typecrate_services::route_metadata()
+            .into_iter()
+            .filter(|route| route.port == Some(port))
+            .map(|route| format!("{} {}", route.method, route.path))
+            .collect()
+    }
+
+    /// One banner line per extra listener: the URL a client can dial on it plus the API
+    /// paths mounted there, in the same `  <label padded> <value>` column as the rest of
+    /// the banner (see `banner_field`).
+    ///
+    /// It answers `[]` when there is no extra listener, and that is the mechanism keeping
+    /// the zero-declared-ports banner byte-identical to the single-listener one: the
+    /// caller prints what it is handed, and it is handed nothing.
+    ///
+    /// The label reports the port the SOCKET bound (what a client dials), the path list
+    /// the port the group DECLARED; those are the same number except for a literal
+    /// `port: 0` declaration, which asks the OS for a free port.
+    fn extra_listener_lines(extra: &[(SocketAddr, Vec<String>)]) -> Vec<String> {
+        extra
+            .iter()
+            .map(|(addr, routes)| {
+                // Same rule as the default listener's lines: a wildcard bind is reported
+                // as loopback, because `http://0.0.0.0:8010` is not something to open.
+                let base = url_for(local_report_ip(*addr), addr.port(), "");
+                let served = if routes.is_empty() {
+                    // Unreachable today (every derived port comes from a row that names
+                    // itself), but an honest line beats a dangling ` - `.
+                    "no declared route".to_owned()
+                } else {
+                    routes.join(", ")
+                };
+                banner_field(
+                    &format!("listener {}:", addr.port()),
+                    format!("{base} - {served}"),
+                )
+            })
+            .collect()
+    }
+
+    /// The shutdown future of EVERY listener: the shared flag, never the signal itself.
+    ///
+    /// `borrow_and_update` marks the current value as seen, so the leading check covers a
+    /// signal that fired before this listener was spawned, and `changed()` only errors once
+    /// every sender is gone (the exit path, not a request path). A `watch` rather than one
+    /// shared future because each listener polls its own copy: a single future can only be
+    /// awaited in one place, and `Notify::notify_waiters` wakes only the receivers that
+    /// already registered.
+    async fn wait_for_shutdown(mut seen: watch::Receiver<bool>) {
+        while !*seen.borrow_and_update() {
+            if seen.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Binds, serves, and stops accepting on the first shutdown signal.
     ///
     /// The listener is bound by hand so a refused bind becomes this server's own
     /// message. `local_addr` is logged rather than assumed, because `--port 0` is a
     /// valid way to ask for any free port.
+    ///
+    /// ZERO declared ports is exactly one bind, one `axum::serve`, one banner: the extra
+    /// code below is driven by `declared_ports()`, and every loop over it runs zero times
+    /// while the route files declare no port (`extra_listener_lines` answers `[]`). With
+    /// declared ports the process binds one listener per port on the SAME host and serves
+    /// `app_for(Some(port), state)` beside the default `app_for(None, state)`.
     async fn serve(config: Config) -> i32 {
         let state = AppState::new(config.database_root);
+
+        // The extra listeners are DERIVED from the compiled-in route table, never
+        // configured: `server::declared_ports()` reads the same table the routers are built
+        // from, so a declared port cannot end up without a listener and a listener cannot
+        // exist for a port nothing declares. The default listener is not part of that set -
+        // its port is the operator's business, resolved just above by `from_parts`.
+        let declared = declared_ports();
+
+        // A route port that names the default port fails the start, before anything binds.
+        if let Err(message) = check_declared_port_collisions(config.addr, &declared) {
+            eprintln!("typecrate-services-server: {message}");
+            return EXIT_RUNTIME;
+        }
+
         let listener = match TcpListener::bind(config.addr).await {
             Ok(listener) => listener,
             Err(err) if err.kind() == ErrorKind::AddrInUse => {
@@ -545,6 +712,31 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             }
         };
 
+        // Every declared port binds BEFORE anything is served, so a refused extra bind
+        // fails the whole start instead of leaving the default listener up with a route
+        // file that has nowhere to answer. `(bound socket, bound address, declared port)`.
+        let mut extra: Vec<(TcpListener, SocketAddr, u16)> = Vec::new();
+        for port in declared {
+            let bound = match bind_declared_listener(config.addr, port).await {
+                Ok(listener) => listener,
+                Err(message) => {
+                    eprintln!("typecrate-services-server: {message}");
+                    return EXIT_RUNTIME;
+                }
+            };
+            let bound_addr = match bound.local_addr() {
+                Ok(addr) => addr,
+                Err(err) => {
+                    eprintln!(
+                        "typecrate-services-server: bound port {port} for a route file but \
+                         cannot read its address: {err}"
+                    );
+                    return EXIT_RUNTIME;
+                }
+            };
+            extra.push((bound, bound_addr, port));
+        }
+
         // The bind answer is printed as an *address*, not as a URL: `http://0.0.0.0`
         // is exactly the mistake this banner exists to remove. The lines below are the
         // URLs a client can actually open.
@@ -571,35 +763,100 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
         for line in banner_lines(local, lan_ip) {
             println!("{line}");
         }
+        // Then one line per extra listener - empty when nothing was declared, which is
+        // what keeps the single-listener banner byte-identical.
+        let banner_extra: Vec<(SocketAddr, Vec<String>)> = extra
+            .iter()
+            .map(|(_, addr, port)| (*addr, declared_routes_for_port(*port)))
+            .collect();
+        for line in extra_listener_lines(&banner_extra) {
+            println!("{line}");
+        }
 
-        // Graceful shutdown, in the order the standalone entry performs it.
+        // Graceful shutdown, in the order the standalone entry performs it, decided ONCE
+        // for the whole process and shared by every listener:
         //
-        // `shutdown_signal()` resolves on Ctrl+C/SIGTERM. The harness half runs FIRST,
-        // before axum stops accepting, because it is what makes the drain FINISH:
-        // `begin_shutdown_all` (`typecrate_harness::server:129-134`) marks every cached
-        // root's store `shuttingDown` - no further turn is claimed - and closes every live
-        // event stream with 1001. Without it this listener owns the streams (the harness
-        // route is mounted here, not on a standalone harness listener), an open SSE or
-        // WebSocket response never completes, and `serve`'s graceful drain would wait on
-        // clients that are only waiting on US. It is a no-op when this process serves no
-        // harness root (the remote-hosts mode), so one path is correct for both.
-        match axum::serve(listener, app(state))
-            .with_graceful_shutdown(async {
+        //   * one task waits for Ctrl+C / SIGTERM;
+        //   * it runs `begin_shutdown_all` (`typecrate_harness::server:129-134`) BEFORE the
+        //     flag flips, i.e. before any listener stops accepting - the same order the
+        //     single-listener version used. It is what makes the drain FINISH: it marks
+        //     every cached root's store `shuttingDown` (no further turn is claimed) and
+        //     closes every live event stream with 1001, so an open SSE or WebSocket
+        //     response is not left waiting on US while we wait on it. A process serving no
+        //     harness root answers quietly, so one path is right for both modes.
+        //   * each listener then drains on the flag, so no listener can "win" the signal
+        //     and leave the others accepting forever.
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let signal = {
+            let stop_tx = stop_tx.clone();
+            tokio::spawn(async move {
                 shutdown_signal().await;
-
                 typecrate_harness::server::begin_shutdown_all();
+                let _ = stop_tx.send(true);
             })
-            .await
+        };
+
+        // One `axum::serve` per listener. The router is chosen by the port, and it is the
+        // DECLARED port that selects the mounted groups; the bound address is only what
+        // the banner reports (the two differ for a literal `port: 0` declaration).
+        let mut serving = JoinSet::new();
         {
-            Ok(()) => {
-                println!("typecrate-services-server: shutdown complete");
-                EXIT_OK
+            let stop = stop_rx.clone();
+            let state = state.clone();
+            serving.spawn(async move {
+                axum::serve(listener, app_for(None, state))
+                    .with_graceful_shutdown(wait_for_shutdown(stop))
+                    .await
+            });
+        }
+        for (listener, _bound, port) in extra {
+            let stop = stop_rx.clone();
+            let state = state.clone();
+            serving.spawn(async move {
+                axum::serve(listener, app_for(Some(port), state))
+                    .with_graceful_shutdown(wait_for_shutdown(stop))
+                    .await
+            });
+        }
+
+        // Wait for EVERY listener, keeping the first failure. `serve` returning Ok is the
+        // "shutdown complete" case the single-listener version printed; a listener that
+        // stopped by itself is a server error and takes the exit code, but still drains its
+        // siblings instead of orphaning them.
+        let mut exit = EXIT_OK;
+        while let Some(joined) = serving.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    eprintln!("typecrate-services-server: server error: {err}");
+                    exit = EXIT_RUNTIME;
+                }
+                // A panic inside one accept loop used to leave through `block_on` and take
+                // the process with it; as a task it surfaces here, the remaining listeners
+                // are drained, and the process still exits 1.
+                Err(err) => {
+                    eprintln!("typecrate-services-server: listener task failed: {err}");
+                    exit = EXIT_RUNTIME;
+                }
             }
-            Err(err) => {
-                eprintln!("typecrate-services-server: server error: {err}");
-                EXIT_RUNTIME
+            if exit != EXIT_OK {
+                // Same drain as the signal path (and `begin_shutdown_all` is idempotent: a
+                // store already marked `shuttingDown` stays marked and the streams are
+                // already closed), so an event stream on another listener cannot hold the
+                // drain open forever.
+                typecrate_harness::server::begin_shutdown_all();
+                let _ = stop_tx.send(true);
             }
         }
+        // Nothing serves any more, so the signal task's Ctrl+C wait has to be released:
+        // dropping the runtime blocks on spawned tasks, and that one only ends when
+        // somebody presses Ctrl+C. Aborting an already-finished task is a no-op.
+        signal.abort();
+
+        if exit == EXIT_OK {
+            println!("typecrate-services-server: shutdown complete");
+        }
+        exit
     }
 
     /// Resolves when the process should stop: Ctrl+C / Ctrl+Break (windows and unix)
@@ -682,7 +939,7 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             // gateway. A test that asserts `0.0.0.0` here is what stops the default
             // from silently sliding back to loopback.
             let resolved = config(&[], None, None);
-            assert_eq!(resolved.addr.to_string(), "0.0.0.0:5001");
+            assert_eq!(resolved.addr.to_string(), "0.0.0.0:8000");
             assert_eq!(resolved.database_root, default_database_root());
             assert!(!resolved.help);
         }
@@ -692,7 +949,7 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             // A bare `--addr 127.0.0.1` is the documented opt-in out of the LAN, so it
             // has to survive both an env ip (it keeps env's port) and a later --port
             // (which must not resurrect the wildcard default host).
-            assert_eq!(addr(&["--addr", "127.0.0.1"], None), "127.0.0.1:5001");
+            assert_eq!(addr(&["--addr", "127.0.0.1"], None), "127.0.0.1:8000");
             assert_eq!(
                 addr(&["-a", "127.0.0.1"], Some("0.0.0.0:8080")),
                 "127.0.0.1:8080"
@@ -705,7 +962,7 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
                 "127.0.0.1:4321"
             );
             // Loopback asked for through the environment alone is honoured too.
-            assert_eq!(addr(&[], Some("127.0.0.1:5001")), "127.0.0.1:5001");
+            assert_eq!(addr(&[], Some("127.0.0.1:8000")), "127.0.0.1:8000");
         }
 
         #[test]
@@ -720,7 +977,7 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             // through env + cli port (the two halves compose, they never clobber).
             let custom_env = config(&[], Some("192.168.0.7:1234"), None);
             assert_eq!(custom_env.addr.to_string(), "192.168.0.7:1234");
-            let custom_port = config(&["--port", "8080"], Some("10.0.0.5:5001"), None);
+            let custom_port = config(&["--port", "8080"], Some("10.0.0.5:8000"), None);
             assert_eq!(custom_port.addr.to_string(), "10.0.0.5:8080");
         }
 
@@ -750,14 +1007,14 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             // like a bare IPv4: built-in default, then env, then `--port` on top. (An
             // UNBRACKETED `::1` stays a usage error on purpose: without the brackets the
             // value is ambiguous with `host:port`, and this CLI never guesses.)
-            assert_eq!(addr(&["--addr", "[::1]"], None), "[::1]:5001");
+            assert_eq!(addr(&["--addr", "[::1]"], None), "[::1]:8000");
             assert_eq!(
                 addr(&["--addr", "[::1]", "--port", "7007"], None),
                 "[::1]:7007"
             );
-            assert_eq!(addr(&["--addr", "[::]"], None), "[::]:5001");
+            assert_eq!(addr(&["--addr", "[::]"], None), "[::]:8000");
             // A bracketed IPv4 is the same shape and lands on the same answer.
-            assert_eq!(addr(&["--addr", "[127.0.0.1]"], None), "127.0.0.1:5001");
+            assert_eq!(addr(&["--addr", "[127.0.0.1]"], None), "127.0.0.1:8000");
             // The env value goes through the same rule, and a CLI port still composes.
             assert_eq!(addr(&[], Some("[::1]:4321")), "[::1]:4321");
             assert_eq!(addr(&["--port", "4321"], Some("[::1]")), "[::1]:4321");
@@ -788,7 +1045,7 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             );
             // The whole point of the brackets: an unbracketed IPv6 plus a port is
             // ambiguous, so it is refused rather than re-split.
-            assert!(from_parts(&flags(&["--addr", "::1:5001"]), None, None).is_err());
+            assert!(from_parts(&flags(&["--addr", "::1:8000"]), None, None).is_err());
         }
 
         #[test]
@@ -810,7 +1067,7 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             // must not depend on the address parsing.
             let help = config(&["--help", "--addr", "not an address"], None, None);
             assert!(help.help);
-            assert_eq!(help.addr.to_string(), "0.0.0.0:5001");
+            assert_eq!(help.addr.to_string(), "0.0.0.0:8000");
 
             // An unknown OPTION is rejected while parsing, which is before help.
             assert_eq!(
@@ -856,7 +1113,7 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             // that there is no auth, the endpoint scope, and the four framework
             // builtins (the two page paths are kept in sync with the constants
             // `banner_lines` prints, the two assets with `server::app`).
-            assert!(HELP.contains("Default 0.0.0.0:5001"));
+            assert!(HELP.contains("Default 0.0.0.0:8000"));
             assert!(HELP.contains("--addr 127.0.0.1"));
             assert!(HELP.contains("Windows Firewall"));
             assert!(HELP.contains("never straight onto the public internet"));
@@ -880,7 +1137,7 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             assert!(HELP.contains("distinct --port values"));
             // The IPv6 host form the parser accepts is spelled out where a human reads
             // it, and it is the same message `parse_addr` produces on a bad value.
-            assert!(HELP.contains("[::1] or [::1]:5001"));
+            assert!(HELP.contains("[::1] or [::1]:8000"));
         }
 
         #[test]
@@ -914,9 +1171,9 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
         fn a_bind_answer_is_reported_as_the_url_that_actually_works_here() {
             // `0.0.0.0`/`::` are not navigable, and a host-specific bind does not
             // answer on loopback, so the local URL has to follow the bind.
-            let wildcard_v4: SocketAddr = "0.0.0.0:5001".parse().unwrap();
+            let wildcard_v4: SocketAddr = "0.0.0.0:8000".parse().unwrap();
             let wildcard_v6: SocketAddr = "[::]:7007".parse().unwrap();
-            let host: SocketAddr = "192.168.1.20:5001".parse().unwrap();
+            let host: SocketAddr = "192.168.1.20:8000".parse().unwrap();
             let loopback: SocketAddr = "127.0.0.1:4321".parse().unwrap();
 
             assert_eq!(local_report_ip(wildcard_v4).to_string(), "127.0.0.1");
@@ -927,14 +1184,14 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
 
         #[test]
         fn a_wildcard_bind_prints_loopback_urls_and_the_detected_lan_url() {
-            let local: SocketAddr = "0.0.0.0:5001".parse().unwrap();
+            let local: SocketAddr = "0.0.0.0:8000".parse().unwrap();
             let lan = IpAddr::from([192, 168, 1, 20]);
             assert_eq!(
                 banner_lines(local, Some(lan)),
                 vec![
-                    "  playground:       http://127.0.0.1:5001/",
-                    "  endpoint list:    http://127.0.0.1:5001/v1/services/routes",
-                    "  other devices:    http://192.168.1.20:5001/",
+                    "  playground:       http://127.0.0.1:8000/",
+                    "  endpoint list:    http://127.0.0.1:8000/v1/services/routes",
+                    "  other devices:    http://192.168.1.20:8000/",
                     NOTE_LINE,
                 ]
             );
@@ -944,13 +1201,13 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
         fn a_wildcard_bind_without_a_probe_answer_keeps_the_placeholder() {
             // Offline host / only link-local candidates: an honest placeholder beats
             // a made-up address, and the note line still says why it may not work.
-            let local: SocketAddr = "0.0.0.0:5001".parse().unwrap();
+            let local: SocketAddr = "0.0.0.0:8000".parse().unwrap();
             assert_eq!(
                 banner_lines(local, None),
                 vec![
-                    "  playground:       http://127.0.0.1:5001/",
-                    "  endpoint list:    http://127.0.0.1:5001/v1/services/routes",
-                    "  other devices:    http://<this machine's LAN ip>:5001/",
+                    "  playground:       http://127.0.0.1:8000/",
+                    "  endpoint list:    http://127.0.0.1:8000/v1/services/routes",
+                    "  other devices:    http://<this machine's LAN ip>:8000/",
                     NOTE_LINE,
                 ]
             );
@@ -974,14 +1231,14 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
         fn an_explicit_host_bind_prints_that_host_only() {
             // The operator named the interface, so the probe result is irrelevant -
             // and 127.0.0.1 must not be offered, because it is refused here.
-            let local: SocketAddr = "192.168.1.20:5001".parse().unwrap();
+            let local: SocketAddr = "192.168.1.20:8000".parse().unwrap();
             let other = IpAddr::from([10, 0, 0, 5]);
             assert_eq!(
                 banner_lines(local, Some(other)),
                 vec![
-                    "  playground:       http://192.168.1.20:5001/",
-                    "  endpoint list:    http://192.168.1.20:5001/v1/services/routes",
-                    "  other devices:    http://192.168.1.20:5001/",
+                    "  playground:       http://192.168.1.20:8000/",
+                    "  endpoint list:    http://192.168.1.20:8000/v1/services/routes",
+                    "  other devices:    http://192.168.1.20:8000/",
                     NOTE_LINE,
                 ]
             );
@@ -1000,6 +1257,158 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
                     NOTE_LINE,
                 ]
             );
+        }
+
+        // -------------------------------------------------------------------
+        // Declared-port tests. Also pure: the listener set is DERIVED from the
+        // compiled-in route table, so what is pinned here is the rules around it -
+        // the collision check, the banner lines it produces, and the drain flag the
+        // listeners share - never a socket.
+        // -------------------------------------------------------------------
+
+        /// The default bind of this build must not be a port a route file declares, or
+        /// every unconfigured start would stop at the collision check.
+        #[test]
+        fn no_route_file_declares_the_built_in_default_port() {
+            let default: SocketAddr = DEFAULT_ADDR.parse().unwrap();
+            let declared = declared_ports();
+            assert!(
+                check_declared_port_collisions(default, &declared).is_ok(),
+                "the route tree declares the built-in default port {default}: {declared:?}"
+            );
+            // The set arrives sorted and de-duplicated (it is what the banner prints and
+            // what gets bound in order), and every port in it has at least one row in the
+            // listing - the same table both are derived from.
+            let mut expected = declared.clone();
+            expected.sort_unstable();
+            expected.dedup();
+            assert_eq!(
+                expected, declared,
+                "`declared_ports()` must be sorted and unique"
+            );
+            for port in &declared {
+                assert!(
+                    !declared_routes_for_port(*port).is_empty(),
+                    "port {port} is bound but declares no route"
+                );
+            }
+        }
+
+        /// AC5: a declared port that equals the resolved default port is a startup error
+        /// that names the port, the socket and the flag that moves it - and nothing else is.
+        #[test]
+        fn a_route_declaring_the_default_port_is_a_clean_startup_error() {
+            let default: SocketAddr = "0.0.0.0:8000".parse().unwrap();
+            // No declarations at all (the single-listener case) and declarations of OTHER
+            // ports are both fine; the default listener is never part of the set.
+            assert_eq!(check_declared_port_collisions(default, &[]), Ok(()));
+            assert_eq!(
+                check_declared_port_collisions(default, &[8010, 9000]),
+                Ok(())
+            );
+
+            const EXPECTED: &str = concat!(
+                "a route file declares port 8000 and this process binds 0.0.0.0:8000, so both ",
+                "listeners want the same socket. They are separate listeners and neither ",
+                "shares it: move the default with --port <other> (or change the declaration). ",
+                "Nothing was bound.",
+            );
+            assert_eq!(
+                check_declared_port_collisions(default, &[8010, 8000])
+                    .err()
+                    .as_deref(),
+                Some(EXPECTED)
+            );
+
+            // The rule is about the RESOLVED port, so `--port 4321` collides with a 4321
+            // declaration and not with an untouched 8000 one.
+            let loopback: SocketAddr = "127.0.0.1:4321".parse().unwrap();
+            assert_eq!(check_declared_port_collisions(loopback, &[8000]), Ok(()));
+            assert!(check_declared_port_collisions(loopback, &[4321]).is_err());
+        }
+
+        /// AC4: the single-listener banner survives byte for byte because the extra lines
+        /// are a `Vec` the caller prints, and it is empty when nothing was declared.
+        #[test]
+        fn no_declared_port_prints_no_extra_banner_line() {
+            let none: Vec<String> = Vec::new();
+            assert_eq!(extra_listener_lines(&[]), none);
+        }
+
+        #[test]
+        fn a_declared_listener_is_printed_as_its_own_url_and_paths() {
+            // A wildcard bind is reported as loopback exactly like the other banner lines,
+            // and the value is the API surface of THAT listener - not the playground, which
+            // an extra listener does not serve.
+            let wildcard: SocketAddr = "0.0.0.0:8010".parse().unwrap();
+            assert_eq!(
+                extra_listener_lines(&[(wildcard, vec!["GET /v1/services/health".to_owned()])]),
+                vec!["  listener 8010:    http://127.0.0.1:8010 - GET /v1/services/health"]
+            );
+
+            // One line per listener, in the order the sorted set produced, and an explicit
+            // host bind is reported as itself (127.0.0.1 would be refused there).
+            let lan: SocketAddr = "192.168.1.20:9000".parse().unwrap();
+            assert_eq!(
+                extra_listener_lines(&[
+                    (wildcard, vec!["GET /a".to_owned(), "POST /b".to_owned()]),
+                    (lan, vec![]),
+                ]),
+                vec![
+                    "  listener 8010:    http://127.0.0.1:8010 - GET /a, POST /b",
+                    "  listener 9000:    http://192.168.1.20:9000 - no declared route",
+                ]
+            );
+        }
+
+        /// The drain flag is shared, not competed for: one decision stops every listener,
+        /// a listener that arrives after the decision does not wait, and a listener does not
+        /// hang once the process is on its way out (every sender gone).
+        #[tokio::test]
+        async fn every_listener_stops_when_the_shared_flag_flips() {
+            let (tx, rx) = watch::channel(false);
+            let waiting = tokio::spawn(wait_for_shutdown(rx));
+            tx.send(true).expect("a listener is still waiting");
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+                .await
+                .expect("the wait ends when the flag flips")
+                .expect("the wait does not panic");
+        }
+
+        #[tokio::test]
+        async fn a_late_listener_does_not_wait_on_a_flag_that_already_flipped() {
+            // The `borrow_and_update` check is what covers a signal arriving between binding
+            // a socket and spawning that socket's serve task.
+            let (_tx, rx) = watch::channel(true);
+            tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_shutdown(rx))
+                .await
+                .expect("an already-set flag is not a wait");
+        }
+
+        #[tokio::test]
+        async fn a_dropped_sender_ends_the_wait_instead_of_hanging() {
+            let (tx, rx) = watch::channel(false);
+            drop(tx);
+            tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_shutdown(rx))
+                .await
+                .expect("with no sender left there is no further signal");
+        }
+
+        /// The route-port story a human reads offline: that declarations exist, that each
+        /// one is its own listener serving only its own paths, that two ports serving one
+        /// path do not override each other, that the builtins stay on the default listener,
+        /// and that a clash with the bound port stops the start.
+        #[test]
+        fn help_documents_the_ports_a_route_file_may_declare() {
+            assert!(HELP.contains("PORTS A ROUTE FILE DECLARES"));
+            assert!(HELP.contains("gets its OWN listener"));
+            assert!(HELP.contains("each listener serves only the paths that declared it"));
+            assert!(HELP.contains("served on both, independently - neither"));
+            assert!(HELP.contains("declaration overrides the other"));
+            assert!(HELP.contains("framework builtins of the DEFAULT listener"));
+            assert!(HELP.contains("answer 404 on a declared one"));
+            assert!(HELP.contains("two listeners cannot share one socket"));
+            assert!(HELP.contains("The startup banner lists"));
         }
     }
 }

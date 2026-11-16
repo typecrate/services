@@ -37,10 +37,12 @@ pub fn echo(text: &str) -> String {
 //
 // ORDER MATTERS (integration contract with build.rs, owned by T11):
 //   * build.rs writes `service_routes.rs` into OUT_DIR; the generator emits
-//     `pub fn register_routes(router: axum::Router<crate::server::AppState>) ->
-//     axum::Router<crate::server::AppState>` plus one `#[path] mod` per discovered
-//     route file (`build_support/emit.rs:63-78`, name from
-//     `build_support/mod.rs::GENERATED_FUNCTION`).
+//     `pub fn register_routes(router: axum::Router<crate::server::AppState>, port:
+//     Option<u16>) -> axum::Router<crate::server::AppState>` plus one `#[path] mod` per
+//     discovered route file (`build_support/emit.rs:63-78`, name from
+//     `build_support/mod.rs::GENERATED_FUNCTION`). `port` is the listener being built
+//     (`None` = the default one), and each route module mounts only the groups that
+//     declare it (`src/server/metadata.rs`).
 //   * The generated header names THIS file as the include site, at CRATE scope, and
 //     the signatures use absolute `crate::server::AppState` paths so that is the
 //     only place they read correctly. The include location and the call path are a
