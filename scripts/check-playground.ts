@@ -79,13 +79,15 @@ const { JSDOM, VirtualConsole } = jsdomModule;
 
 // ------------------------------------------------------------------------ fixtures
 
-/// The nineteen endpoints the compiled server lists, exactly as `GET /v1/services/routes`
+/// The twenty-three endpoints the compiled server lists, exactly as `GET /v1/services/routes`
 /// serialises them (`EndpointMeta` field order is JSON key order, `src/server/metadata.rs`).
 ///
-/// The three `/v1/harness` rows come FIRST: the bridge's route file lives in the harness
-/// package (`packages/typecrate/harness/endpoint/harness/harness-route.rs`), and a scan rooted
-/// at the repository default sorts `packages/typecrate/h…` before `packages/typecrate/s…`
-/// (R2, pinned by `tests/discovery.rs::the_harness_bridge_in_another_package_is_discovered_and_registered`
+/// The three `/v1/harness` rows come FIRST and the four `/providers/private/v1` rows come SECOND:
+/// both bridges' route files live in OTHER packages
+/// (`packages/typecrate/harness/endpoint/harness/harness-route.rs` and
+/// `packages/typecrate/provider/endpoint/provider/provider-route.rs`), and a scan rooted at the
+/// repository default sorts `packages/typecrate/h…` before `packages/typecrate/p…` before
+/// `packages/typecrate/s…` (R2, pinned by `tests/discovery.rs::the_harness_bridge_in_another_package_is_discovered_and_registered`
 /// and by `tests/server_http.rs::route_table`). `ANY` is the listing token of a verb-agnostic
 /// mount, not a wire verb. The rest is the scanner's byte-wise order of this package's route
 /// files, so `POST /v1/services/echo` leads and the two REST sample trees come last,
@@ -95,6 +97,13 @@ const LISTING_JSON =
     '[{"method":"ANY","path":"/v1/harness","summary":"Underload harness service document"},' +
     '{"method":"ANY","path":"/v1/harness/stream","summary":"Underload harness realtime stream (harness.v1 WebSocket)"},' +
     '{"method":"ANY","path":"/v1/harness/{*rest}","summary":"Underload harness API resources"},' +
+    // The provider bridge: four `ANY` groups, EVERY one of them declaring `, port: 8800` in
+    // `packages/typecrate/provider/endpoint/provider/provider-route.rs`, so all four rows carry the
+    // key (unlike the `health` pair below, only ONE of which is ported). `port` is again the last key.
+    '{"method":"ANY","path":"/providers/private/v1/chat/completions","summary":"OpenAI-compatible chat completions relay","port":8800},' +
+    '{"method":"ANY","path":"/providers/private/v1/responses","summary":"OpenAI-compatible responses relay","port":8800},' +
+    '{"method":"ANY","path":"/providers/private/v1/models","summary":"List the served model catalog","port":8800},' +
+    '{"method":"ANY","path":"/providers/private/v1/stats","summary":"Report provider token stats, or reset one model\'s stats","port":8800},' +
     '{"method":"POST","path":"/v1/services/echo","summary":"Echoes the posted `value` unchanged"},' +
     '{"method":"GET","path":"/v1/services/echo/{value}","summary":"Echoes `{value}`, with `?prefix=` applied"},' +
     '{"method":"GET","path":"/v1/services/health","summary":"Reports the service name and version"},' +
@@ -398,7 +407,7 @@ const LABEL_422 = await statusLabel(422, 'POST', '/v1/services/echo', {
 const LABEL_415 = await statusLabel(415, 'POST', '/v1/services/echo', { headers: {} });
 
 // --- 1. the listing drives the rail: rows, order, count, and one automatic request --
-await waitFor('endpoint list', () => doc.querySelectorAll('#endpoint-list button').length === 19);
+await waitFor('endpoint list', () => doc.querySelectorAll('#endpoint-list button').length === 23);
 check(
     'endpoint rows',
     [...doc.querySelectorAll('#endpoint-list button')]
@@ -414,6 +423,13 @@ check(
         'ANY|/v1/harness|Underload harness service document',
         'ANY|/v1/harness/stream|Underload harness realtime stream (harness.v1 WebSocket)',
         'ANY|/v1/harness/{*rest}|Underload harness API resources',
+        // The provider bridge in listing order. Only the three text nodes are read here, which is again
+        // the evidence that the `port 8800` marker is a SEPARATE node and never a rewrite of the path
+        // (the `7b` section pins the marker text).
+        'ANY|/providers/private/v1/chat/completions|OpenAI-compatible chat completions relay',
+        'ANY|/providers/private/v1/responses|OpenAI-compatible responses relay',
+        'ANY|/providers/private/v1/models|List the served model catalog',
+        "ANY|/providers/private/v1/stats|Report provider token stats, or reset one model's stats",
         'POST|/v1/services/echo|Echoes the posted `value` unchanged',
         'GET|/v1/services/echo/{value}|Echoes `{value}`, with `?prefix=` applied',
         'GET|/v1/services/health|Reports the service name and version',
@@ -435,7 +451,7 @@ check(
         'DELETE|/v1/services/pets/{id}|Removes one pet by id and answers 204, or 404 when the id is unknown',
     ].join('\n'),
 );
-check('endpoint count', text('endpoint-count'), '19 endpoints');
+check('endpoint count', text('endpoint-count'), '23 endpoints');
 check('endpoint rail state is quiet', text('endpoint-state'), '');
 check('the method becomes a data attribute, never a style', doc.querySelector('#endpoint-list .badge').getAttribute('data-method'), 'any');
 check('listing request url', requests[0].url, '/v1/services/routes');
@@ -543,7 +559,7 @@ check('the previous response is kept while input is invalid', text('response-bod
 element('endpoint-search').value = 'health';
 element('endpoint-search').dispatchEvent(new window.Event('input', { bubbles: true }));
 await waitFor('filtered rail', () => doc.querySelectorAll('#endpoint-list button').length === 2);
-check('filtered count', text('endpoint-count'), '2 matches of 19');
+check('filtered count', text('endpoint-count'), '2 matches of 23');
 check('a filter that matches leaves the state line empty', text('endpoint-state'), '');
 check('the composer keeps its selection', text('composer-target'), 'GET /v1/services/echo/{value}');
 element('endpoint-search').value = 'nope';
@@ -552,7 +568,7 @@ await waitFor('empty rail', () => doc.querySelectorAll('#endpoint-list button').
 check('no-match state', text('endpoint-state'), 'No endpoint matches "nope".');
 element('endpoint-search').value = '';
 element('endpoint-search').dispatchEvent(new window.Event('input', { bubbles: true }));
-await waitFor('full rail', () => doc.querySelectorAll('#endpoint-list button').length === 19);
+await waitFor('full rail', () => doc.querySelectorAll('#endpoint-list button').length === 23);
 
 // --- 7b. the two rows that share one API path --------------------------------------
 // The duplicate path has to stay separately addressable and separately describable. The rail keys
@@ -570,18 +586,22 @@ check(
         .join('\n'),
     [HEALTH_LABEL_UNPORTED, HEALTH_LABEL_PORTED].join('\n'),
 );
-// The listener marker: present and exact on the ported row, absent on every other row. An unported
+// The listener marker: present and exact on a ported row, absent on an unported one. An unported
 // row has NO marker at all - "no marker" is the page's statement that the row is on the default
 // listener - so the rail cannot invent a listener the listing did not declare. This is also what
-// keeps the 19-row rail pin above untouched: the path and summary nodes still hold exactly their own
+// keeps the 23-row rail pin above untouched: the path and summary nodes still hold exactly their own
 // text, because the port is a separate node.
 const healthRows = [...doc.querySelectorAll('#endpoint-list button[aria-label^="Use GET /v1/services/health "]')];
 check('the ported row names its listener', markerText(healthRows[1]), 'port 8010');
 check('the unported row renders no listener marker', markerText(healthRows[0]), 'no listener marker');
+// Every marker in the rail, in listing order: the four `8800` provider rows come before the single
+// `8010` health row, and the eighteen unported rows contribute nothing. Five markers total, so a
+// row that silently gained or lost a `port` key - or a marker rendered somewhere other than its own
+// node - fails here.
 check(
-    'exactly one row in the whole rail names a listener',
+    'the five ported rows name their listeners, in listing order',
     [...doc.querySelectorAll('#endpoint-list .endpoint-port')].map((node) => node.textContent).join('\n'),
-    'port 8010',
+    ['port 8800', 'port 8800', 'port 8800', 'port 8800', 'port 8010'].join('\n'),
 );
 // Selection, from both sides of the pair: `renderList` rebuilds the rail on every click, so each row
 // is re-resolved from the live DOM rather than from a node that a previous render detached.
@@ -857,12 +877,12 @@ brokenDoc.getElementById('endpoint-search').dispatchEvent(new brokenDom.window.E
 // (the collapsed one here) is re-derived from the listing that now answers.
 const retried = instrument(brokenDom.window);
 brokenDoc.getElementById('reload-endpoints').click();
-await waitFor('the retried rail', () => brokenDoc.querySelectorAll('#endpoint-list button').length === 19);
+await waitFor('the retried rail', () => brokenDoc.querySelectorAll('#endpoint-list button').length === 23);
 check('the retry issued only the listing request', retried.length, 1);
 check('the retry requested the listing', retried[0].url, '/v1/services/routes');
 check('the retry cleared the error line', brokenText('endpoint-state'), '');
 check('the retry hid itself', brokenDoc.getElementById('reload-endpoints').hidden, true);
-check('the retry reported the count', brokenText('endpoint-count'), '19 endpoints');
+check('the retry reported the count', brokenText('endpoint-count'), '23 endpoints');
 check('the retry enabled the composer', brokenDoc.getElementById('send').disabled, false);
 check('the retry pre-loaded the first entry', brokenText('composer-target'), 'ANY /v1/harness');
 brokenDom.window.close();

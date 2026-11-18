@@ -1028,7 +1028,9 @@ fn the_generated_endpoint_listing_names_the_same_modules_in_the_same_order() {
 /// The `/v1/harness` bridge (`packages/typecrate/harness/endpoint/harness/harness-route.rs`) is the
 /// first route file discovered OUTSIDE this package, which is what makes the repository-root default
 /// (R2) load-bearing rather than incidental: a scan rooted at `packages/typecrate/services` compiles
-/// this crate happily and simply never mounts the harness.
+/// this crate happily and simply never mounts the harness. The provider bridge
+/// (`packages/typecrate/provider/endpoint/provider/provider-route.rs`) is the SECOND such tree, and
+/// the ordering assertion below pins both foreign paths in byte-wise order.
 ///
 /// Nothing here hardcodes the generated identifier - it is read out of the report and re-checked
 /// against the naming rules. What is asserted about the generated text is that the header map, the
@@ -1091,8 +1093,10 @@ fn the_harness_bridge_in_another_package_is_discovered_and_registered() {
         "the report's relative path is the on-disk path from the scan root"
     );
 
-    // Deterministic order (R1): `packages/typecrate/h…` sorts before `packages/typecrate/s…`, so the
-    // bridge is registered FIRST - the exact order `tests/server_http.rs::route_table` pins.
+    // Deterministic order (R1): `packages/typecrate/h…` sorts before `packages/typecrate/p…`, which
+    // sorts before `packages/typecrate/s…`, so the harness bridge is registered FIRST, then the
+    // provider bridge, then this package's own trees - the exact order
+    // `tests/server_http.rs::route_table` pins.
     assert_eq!(report.routes[0].relative_path, HARNESS_ROUTE);
     let after_bridge: Vec<&str> = report
         .routes
@@ -1103,12 +1107,15 @@ fn the_harness_bridge_in_another_package_is_discovered_and_registered() {
     assert_eq!(
         after_bridge,
         [
+            // The second FOREIGN tree: the provider bridge lives in `packages/typecrate/provider`,
+            // i.e. between the harness and this package's `examples/` trees in byte-wise order.
+            "packages/typecrate/provider/endpoint/provider/provider-route.rs",
             "packages/typecrate/services/examples/endpoints/echo/echo-route.rs",
             "packages/typecrate/services/examples/endpoints/health/health-route.rs",
             "packages/typecrate/services/examples/endpoints/locations/locations-route.rs",
             "packages/typecrate/services/examples/endpoints/pets/pets-route.rs",
         ],
-        "the bridge joined the sample set without reordering it"
+        "the foreign bridges joined the sample set without reordering it"
     );
 
     // The generated module wires it up end to end.

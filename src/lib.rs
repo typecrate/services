@@ -58,6 +58,12 @@ include!(concat!(env!("OUT_DIR"), "/service_routes.rs"));
 /// Shared state + the axum `Router` factory for the native runtime.
 pub mod server;
 
+/// The process's log surface: the hand-written `tracing::Subscriber`, the `RUST_LOG` level
+/// filter, and the target the gateway's per-request line is emitted on. The executable installs
+/// it (`src/bin/server.rs`); an embedder that serves `server::app` on its own listener can
+/// install it too, or route the same events through its own subscriber.
+pub mod logging;
+
 #[cfg(test)]
 mod tests {
     use super::*;

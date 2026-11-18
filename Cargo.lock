@@ -1826,6 +1826,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "typecrate-provider"
+version = "1.0.2"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "typecrate-services"
 version = "1.0.2"
 dependencies = [
@@ -1837,7 +1853,10 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-core",
  "typecrate-harness",
+ "typecrate-provider",
 ]
 
 [[package]]

@@ -32,16 +32,21 @@
 //! route file sorts before every `examples/` tree. This file pins those rows as listing entries and
 //! as dispatches - the literal `ANY` verb, answered by the harness dispatcher - while the REST
 //! catalogue and the `harness.v1` upgrade behind them are proven end to end in
-//! `tests/harness_gateway.rs`.
+//! `tests/harness_gateway.rs`. The provider bridge
+//! (`packages/typecrate/provider/endpoint/provider/provider-route.rs`) sorts SECOND, between the
+//! harness and this package's own trees, and contributes four more `ANY` rows - answered here by
+//! the provider handler's own verb gate, and proven end to end in
+//! `packages/typecrate/provider/tests/routes.rs`.
 //!
 //! Since the route grammar grew an optional `, port:` trailer, the listing is ONE table for every
 //! listener while a router is built per listener: `app()` is `app_for(None, ..)` (the default
 //! listener, unported groups only) and `app_for(Some(N), ..)` serves the groups that declare port
 //! N. The `health` sample is therefore listed TWICE - the same API path, once unported and once on
-//! 8010 - which is why the listing below is nineteen rows and not eighteen. The port semantics are
-//! pinned by the three tests at the end of this file: the ported row carries a literal
-//! `"port": 8010` key, the 8010 listener answers the ported mount and 404s the unported ones, and
-//! `declared_ports()` reports the group without a router being started.
+//! 8010 - which is why the listing below is twenty-three rows rather than twenty-two, and the four
+//! provider rows carry `8800`: eighteen unported rows plus one `8010` row plus four `8800` rows. The
+//! port semantics are pinned by the three tests at the end of this file: the ported row carries a
+//! literal `"port": 8010` key, the 8010 listener answers the ported mount and 404s the unported
+//! ones, and `declared_ports()` reports both declared groups without a router being started.
 
 use std::fs;
 use std::io;
@@ -1953,15 +1958,16 @@ async fn pets_list_ignores_every_query_parameter_it_does_not_declare() {
 const PLAYGROUND_CSP: &str = "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'";
 
 /// The whole listing, exactly as the generated table serialises it today: the three `/v1/harness`
-/// rows, the fifteen sample endpoints, and the one demo row that declares a port - in order, with
-/// the summaries their route files author.
+/// rows, the four `/providers/private/v1` rows, the fifteen sample endpoints, and the one demo row
+/// that declares `8010` - in order, with the summaries their route files author.
 ///
 /// Two orders combine into this sequence, and both are pinned elsewhere:
 ///   * between files it is the scanner's registration order (byte-wise comparison
 ///     of the scan-root-relative path, `build_support/discovery.rs`, asserted in
 ///     `tests/discovery.rs`), which puts the FOREIGN tree
-///     `packages/typecrate/harness/endpoint/harness/harness-route.rs` (T6) ahead of this package's
-///     `packages/typecrate/services/examples/endpoints/echo/…`, then `endpoints/health/…`,
+///     `packages/typecrate/harness/endpoint/harness/harness-route.rs` (T6) first, then the second
+///     FOREIGN tree `packages/typecrate/provider/endpoint/provider/provider-route.rs`, then this
+///     package's `packages/typecrate/services/examples/endpoints/echo/…`, then `endpoints/health/…`,
 ///     `endpoints/locations/…` and finally `endpoints/pets/…`;
 ///   * inside one file it is the order the entries are written in
 ///     `crate::service_routes!` (`src/server/metadata.rs:128-160`), concatenated
@@ -1977,7 +1983,7 @@ const PLAYGROUND_CSP: &str = "default-src 'self'; img-src 'self' data:; script-s
 /// The table is NOT filtered by port (`build_support/mod.rs`, `GENERATED_METADATA_FUNCTION`): it is
 /// one row per mounted `(method, path, port)`, so the `health` sample - declared twice in
 /// `examples/endpoints/health/health-route.rs`, once unported and once with `, port: 8010` -
-/// contributes the row at index 5 AND the `port`-carrying row at index 6, in the order the file
+/// contributes the row at index 9 AND the `port`-carrying row at index 10, in the order the file
 /// writes the two groups. That duplicate path is deliberate and is what makes the listing answer
 /// "which listener serves this API path", so the two summaries differ on purpose; nothing else in
 /// the table repeats a path.
@@ -2004,6 +2010,37 @@ fn route_table() -> JsonValue {
             "method": "ANY",
             "path": "/v1/harness/{*rest}",
             "summary": "Underload harness API resources",
+        },
+        // The provider bridge, registered SECOND (its route file sorts between the harness and this
+        // package's `examples/` trees) and in the order that file's `crate::service_routes!` block
+        // declares them. All four groups carry `, port: 8800`, so all four rows carry the key - the
+        // provider mount has no unported twin, unlike `health`. `ANY` here is the provider handler's
+        // own verb gate, not a wire verb: the TypeScript route objects are verb-KEYED maps, and a
+        // verb the map lacks is the gateway's `400 {"error":"handler not found"}` rather than a 405
+        // (`packages/typecrate/provider/endpoint/provider/provider-route.rs`, "Why every group is `ANY`").
+        {
+            "method": "ANY",
+            "path": "/providers/private/v1/chat/completions",
+            "summary": "OpenAI-compatible chat completions relay",
+            "port": 8800,
+        },
+        {
+            "method": "ANY",
+            "path": "/providers/private/v1/responses",
+            "summary": "OpenAI-compatible responses relay",
+            "port": 8800,
+        },
+        {
+            "method": "ANY",
+            "path": "/providers/private/v1/models",
+            "summary": "List the served model catalog",
+            "port": 8800,
+        },
+        {
+            "method": "ANY",
+            "path": "/providers/private/v1/stats",
+            "summary": "Report provider token stats, or reset one model's stats",
+            "port": 8800,
         },
         {
             "method": "POST",
@@ -2235,14 +2272,21 @@ fn listing_entries<'a>(
 }
 
 /// The port the `health` sample declares with its second `, port:` group
-/// (`examples/endpoints/health/health-route.rs`), i.e. the only declared port in this build.
+/// (`examples/endpoints/health/health-route.rs`) - one of the two declared ports in this build.
 const PORTED_HEALTH_PORT: u16 = 8010;
 
-/// The one row of the listing that carries a port, spelled as the exact BYTES the response
-/// contains: field order is `EndpointMeta`'s declaration order, so `port` is last, and `Json`
-/// writes compact JSON (no spaces). Pinned as bytes because `serde_json::Value` cannot express
-/// key order (see [`listing_entries`]), and "an unported row never grew a `\"port\": null`" is
-/// a claim about the published bytes, not about a parsed map.
+/// The port every `/providers/private/v1` group declares
+/// (`packages/typecrate/provider/endpoint/provider/provider-route.rs`, pinned to
+/// `typecrate_provider::serve::PROVIDER_PORT` by that crate's own `tests/routes.rs`).
+const PROVIDER_PORT: u16 = 8800;
+
+/// The `8010` row of the listing, spelled as the exact BYTES the response contains: field order is
+/// `EndpointMeta`'s declaration order, so `port` is last, and `Json` writes compact JSON (no
+/// spaces). Pinned as bytes because `serde_json::Value` cannot express key order (see
+/// [`listing_entries`]), and "an unported row never grew a `\"port\": null`" is a claim about the
+/// published bytes, not about a parsed map. Four more rows carry a port - the four `8800` provider
+/// rows - and the `matches(..).count() == 1` assertion below is what keeps THIS byte string pinned to
+/// the single row it describes rather than to a substring of another row.
 const PORTED_ROW_BYTES: &str = concat!(
     r#"{"method":"GET","path":"/v1/services/health","#,
     r#""summary":"Reports the service name and version on the isolated 8010 listener","#,
@@ -2437,23 +2481,34 @@ async fn routes_metadata_lists_exactly_the_generated_endpoints() {
     );
     assert_eq!(
         entries.len(),
-        19,
-        "the listing did not report the three harness rows, the fifteen sample endpoints and the \
-         one ported row: {raw}"
+        23,
+        "the listing did not report the three harness rows, the four provider rows, the fifteen \
+         sample endpoints and the five ported rows: {raw}"
     );
 
     // The port half of the shape, asserted as an exact list rather than a filter that merely
-    // "finds" a ported row: exactly ONE row carries `port`, it is the second `GET
-    // /v1/services/health` declaration, and the number is 8010. Every other row must have no
-    // `port` key at all, which is what `skip_serializing_if` is for - a `"port": null` on an
-    // unported row would be a wire-format change hiding behind this test's `body` comparison.
+    // "finds" a ported row: exactly FIVE rows carry `port` - the four `8800` provider rows in
+    // listing order, then the second `GET /v1/services/health` declaration on `8010`. Every other
+    // row must have no `port` key at all, which is what `skip_serializing_if` is for - a
+    // `"port": null` on an unported row would be a wire-format change hiding behind this test's
+    // `body` comparison.
     let ported: Vec<(&str, &str, u16)> = entries
         .iter()
         .filter_map(|&(method, path, _, port)| port.map(|port| (method, path, port)))
         .collect();
     assert_eq!(
         ported,
-        [("GET", "/v1/services/health", PORTED_HEALTH_PORT)],
+        [
+            (
+                "ANY",
+                "/providers/private/v1/chat/completions",
+                PROVIDER_PORT
+            ),
+            ("ANY", "/providers/private/v1/responses", PROVIDER_PORT),
+            ("ANY", "/providers/private/v1/models", PROVIDER_PORT),
+            ("ANY", "/providers/private/v1/stats", PROVIDER_PORT),
+            ("GET", "/v1/services/health", PORTED_HEALTH_PORT),
+        ],
         "the listing does not carry exactly the declared port rows: {raw}"
     );
     // The same claim from the other side, as bytes: the ported row is written with `port` LAST
@@ -2681,24 +2736,34 @@ fn dispatch_on_port(
     }
 }
 
-/// The nineteen rows of `route_table`, in that order, each with its contract answer and the
+/// The twenty-three rows of `route_table`, in that order, each with its contract answer and the
 /// listener it is served on.
 ///
-/// The three `ANY` rows come first, and they are dispatched with the LITERAL method the listing
+/// The seven `ANY` rows come first, and they are dispatched with the LITERAL method the listing
 /// advertises: `axum::routing::any` matches every verb, so an `ANY` request really does reach the
-/// handler, and the answer is the harness dispatcher's own contract response for a verb that route
-/// does not declare (405, naming the allowed verbs) or for a path it does not know (404). The
-/// sentences are what make this a precedence proof as well as a dispatch proof: the two harness
-/// mounts answer the SAME wrong verb with two DIFFERENT messages, so a router that handed
-/// `/v1/harness/stream` to the catch-all would fail here instead of quietly passing.
+/// handler, and the answer is the handler's OWN contract response for a verb it does not declare. The
+/// three harness rows get the harness dispatcher's sentences (405, naming the allowed verbs, or 404
+/// for a path it does not know); those sentences are what make this a precedence proof as well as a
+/// dispatch proof, because the two harness mounts answer the SAME wrong verb with two DIFFERENT
+/// messages, so a router that handed `/v1/harness/stream` to the catch-all would fail here instead of
+/// quietly passing. The four provider rows get the gateway's verb-miss answer,
+/// `400 {"error":"handler not found"}`: the TypeScript route objects are verb-KEYED maps, and
+/// `typecrate_provider::serve` reproduces that refusal as gate (1) of every handler — BEFORE the
+/// readiness gate — so the answer is the same whether or not this machine has a vault artifact, which
+/// is what makes one body pinnable for all four rows (`packages/typecrate/provider/tests/routes.rs`,
+/// `the_advertised_any_verb_is_refused_before_readiness_on_every_route`, proves the same bytes against
+/// a ready AND an unready state).
 ///
-/// Row 6 is the only one with a port, and it is dispatched against its OWN listener. Its answer
-/// happens to be the same body row 5 answers on the default listener - the same handler, and a
-/// port is not part of the URL - which is exactly the point: two listeners, one API path, neither
-/// declaration overriding the other. The isolation half (what the 8010 listener does NOT serve)
-/// is pinned by the dedicated port tests below, because on this particular path the default
-/// listener answers for its own unported twin and cannot tell the two apart.
-fn dispatch_plan() -> [Dispatch; 19] {
+/// Rows 4-7 are the provider mount, dispatched against the 8800 listener, and row 11 is the ported
+/// `health` row, dispatched against the 8010 listener: both are dispatched against their OWN
+/// listener. The `health` answer happens to be the same body row 10 answers on the default listener -
+/// the same handler, and a port is not part of the URL - which is exactly the point: two listeners,
+/// one API path, neither declaration overriding the other. The provider rows have no unported twin,
+/// so their 8800 answer is the only answer those paths have anywhere. The isolation half (what the
+/// 8010 listener does NOT serve) is pinned by the dedicated port tests below, because on that
+/// particular path the default listener answers for its own unported twin and cannot tell the two
+/// apart.
+fn dispatch_plan() -> [Dispatch; 23] {
     let pets = pets();
     let locations = locations();
     [
@@ -2728,6 +2793,46 @@ fn dispatch_plan() -> [Dispatch; 19] {
             None,
             reqwest::StatusCode::NOT_FOUND,
             r#"{"error":{"message":"Unknown API route: ANY /v1/harness/probe"}}"#,
+            None,
+        ),
+        // The provider bridge, in its route file's declaration order, on the 8800 listener. No body
+        // either: the verb gate is the handler's first step, ahead of the readiness gate and of any
+        // body read (`packages/typecrate/provider/src/serve.rs`, `completion`), so the refusal is the
+        // gateway's constant 400 whatever the machine's vault state is.
+        dispatch_on_port(
+            PROVIDER_PORT,
+            "ANY",
+            "/providers/private/v1/chat/completions",
+            None,
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"handler not found"}"#,
+            None,
+        ),
+        dispatch_on_port(
+            PROVIDER_PORT,
+            "ANY",
+            "/providers/private/v1/responses",
+            None,
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"handler not found"}"#,
+            None,
+        ),
+        dispatch_on_port(
+            PROVIDER_PORT,
+            "ANY",
+            "/providers/private/v1/models",
+            None,
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"handler not found"}"#,
+            None,
+        ),
+        dispatch_on_port(
+            PROVIDER_PORT,
+            "ANY",
+            "/providers/private/v1/stats",
+            None,
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"handler not found"}"#,
             None,
         ),
         dispatch(
@@ -2877,11 +2982,14 @@ async fn every_listed_endpoint_is_the_method_the_socket_dispatches() {
     // `[]` rows are only true for a store nothing has created into yet).
     let store = StoreFixture::new("routes-dispatch");
     let server = TestServer::start(store.state()).await;
-    // The declared port gets a listener of its own, built by `app_for(Some(N), ..)` on its own
+    // Every declared port gets a listener of its own, built by `app_for(Some(N), ..)` on its own
     // ephemeral socket. Both listeners share this data root, which is fine for the health sample
-    // (it reads no store) and is what lets one plan row per listing row be dispatched against
-    // whichever listener the row declares.
+    // (it reads no store) and for the provider mount (its handlers read the vault artifact, never the
+    // services store), and it is what lets one plan row per listing row be dispatched against
+    // whichever listener the row declares. The sockets are ephemeral, so the two listeners can coexist
+    // even though the routes declare fixed ports.
     let isolated = TestServer::serve_for(Some(PORTED_HEALTH_PORT), store.state()).await;
+    let provider = TestServer::serve_for(Some(PROVIDER_PORT), store.state()).await;
     let client = client();
 
     let listing = json_body(
@@ -2931,6 +3039,9 @@ async fn every_listed_endpoint_is_the_method_the_socket_dispatches() {
         let listener = match row.port {
             None => &server,
             Some(PORTED_HEALTH_PORT) => &isolated,
+            // The provider mount's own listener: without this arm every one of the four provider
+            // plan rows would hit the panic below instead of being dispatched.
+            Some(PROVIDER_PORT) => &provider,
             Some(port) => panic!("the dispatch plan declares an unmodelled port {port}"),
         };
         let concrete = row
@@ -3026,8 +3137,9 @@ async fn every_listed_endpoint_is_the_method_the_socket_dispatches() {
     assert_eq!(head.content_type.as_deref(), Some("application/json"));
     assert_eq!(head.body, "");
 
-    // Both listeners shut down: the isolated one first so a leaked serve task cannot outlive the
+    // Every listener shuts down: the extra ones first so a leaked serve task cannot outlive the
     // test that started it.
+    provider.shutdown().await;
     isolated.shutdown().await;
     server.shutdown().await;
 }
@@ -3281,12 +3393,13 @@ async fn a_port_listener_serves_only_the_groups_that_declare_it() {
 #[tokio::test]
 async fn declared_ports_reports_exactly_the_ports_the_listing_declares() {
     // The helper is derived from the generated table, so it has to agree with the published
-    // listing to the row: `[8010]` here, and exactly one `port`-carrying row there with the same
-    // number. Asserted as an exact `Vec` (sorted and deduplicated by contract), never as `contains`.
+    // listing to the row: `[8010, 8800]` here, and the five `port`-carrying rows there (four on
+    // 8800, one on 8010). Asserted as an exact `Vec` (sorted and deduplicated by contract), never
+    // as `contains`.
     assert_eq!(
         declared_ports(),
-        vec![PORTED_HEALTH_PORT],
-        "the declared ports are not exactly the one group this build compiles in"
+        vec![PORTED_HEALTH_PORT, PROVIDER_PORT],
+        "the declared ports are not exactly the groups this build compiles in"
     );
 
     // The same fact read off the expected table: the rows that carry a `port`, deduplicated and

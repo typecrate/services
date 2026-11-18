@@ -30,11 +30,15 @@ packages/typecrate/services/
   src/server/mod.rs         # AppState (shared state) + the axum `Router` factory + the embedded browser surface
   src/server/metadata.rs    # `EndpointMeta` + the `crate::service_routes!` macro (one entry -> route AND listing)
   src/server/playground.*   # the page/css/js `include_str!`d into the binary (served at `/`, `/playground.css`, `/playground.js`)
-  src/bin/server.rs         # the `typecrate-services-server` executable (CLI, bind, banner, shutdown)
+  src/server/request_log.rs # the gateway's per-request line (`Incoming request: [GET] http://host/path`)
+  src/logging.rs            # the `tracing` subscriber the binary installs: levels, targets, one line per event
+  src/bin/server.rs         # the `typecrate-services-server` executable (CLI, bind, banner, subscriber, shutdown)
   examples/endpoints/**     # the sample endpoint trees: one lightweight `<resource>-route.rs`
                             # plus one `<resource>-core.rs` implementation file per resource
   tests/api.rs              # native-consumption test (links the rlib like a downstream crate)
   tests/discovery.rs        # scanner/generator rules against real fixture trees
+  tests/logging.rs          # the per-request line over a real socket: every listener, preflight, 404, upgrade
+  tests/server_process.rs   # the executable as a process: the request line on ITS stdout, and RUST_LOG
   tests/server_http.rs      # real-TCP HTTP tests of the exact library router
   scripts/discover-services.ts # pre-step: tree-shape snapshot -> Temp/ watched file
   scripts/check-playground.ts  # optional jsdom check of the embedded browser surface
@@ -45,10 +49,12 @@ The one artifact outside the package is the discovery snapshot,
 `build.rs` watches so a new endpoint folder is picked up by the next `npm` run (see
 [Rebuild tracking](#rebuild-tracking-what-re-runs-the-scan-and-what-needs-a-re-scan)).
 
-One discovered **route tree lives outside this package**: the repository-root scan also finds
+Two discovered **route trees live outside this package**: the repository-root scan also finds
 `packages/typecrate/harness/endpoint/harness/harness-route.rs`, the `/v1/harness` bridge, which
-calls into the sibling `typecrate-harness` crate (a native path dependency). That is what makes
-the scan root the repository rather than this folder — see
+calls into the sibling `typecrate-harness` crate, and
+`packages/typecrate/provider/endpoint/provider/provider-route.rs`, the `/providers/private/v1`
+bridge, which calls into the sibling `typecrate-provider` crate (both native path dependencies).
+That is what makes the scan root the repository rather than this folder — see
 [Harness gateway](#harness-gateway-v1harness).
 
 `Cargo.toml` declares its own `[workspace]` on purpose: the package lives where the
@@ -86,6 +92,7 @@ cargo run --bin typecrate-services-server --locked -- --help   # the same, witho
 | Bind address | `-a, --addr <ip[:port]>`, `--port <port>` | `TYPECRATE_SERVICES_ADDR` | `0.0.0.0:8000` |
 | Writable data root | `--database-root <dir>` | `TYPECRATE_SERVICES_DATABASE_ROOT` | `<repo-parent>/temporary/dump` |
 | Request body cap | — (constant) | — | `1 MiB` (`server::MAX_REQUEST_BODY_BYTES`) |
+| Log verbosity | — (no flag) | `RUST_LOG` | `info` — `off|none|error|warn|info|debug|trace`, optionally `target=level` scoped ([What a running server prints](#what-a-running-server-prints)) |
 
 Precedence per setting: **flag, then environment, then built-in default**. A bare
 `--addr` keeps the already-selected port, `--port` keeps the already-selected host,
@@ -150,27 +157,108 @@ typecrate-services-server listening on 0.0.0.0:8000 - every interface
   other devices:    http://192.168.1.20:8000/
   note:             unauthenticated - trusted LAN only, never the public internet; Windows Firewall may prompt on first start
   listener 8010:    http://127.0.0.1:8010 - GET /v1/services/health
+  listener 8800:    http://127.0.0.1:8800 - ANY /providers/private/v1/chat/completions, ANY /providers/private/v1/responses, ANY /providers/private/v1/models, ANY /providers/private/v1/stats
 ```
 
-The last line is the extra listener the compiled-in route table declares (the `health`
-sample writes its second `, port: 8010` group), and there is exactly one such line per
-distinct declared port — `server::declared_ports()` is where the bin reads them, so the
+The last two lines are the extra listeners the compiled-in route table declares (the `health`
+sample writes its second `, port: 8010` group, and the four `/providers/private/v1` groups of the
+foreign route file `packages/typecrate/provider/endpoint/provider/provider-route.rs` each declare
+`port: 8800`), and there is exactly one such line per distinct declared port —
+`server::declared_ports()` is where the bin reads them, ascending, so the
 banner cannot advertise a listener the routes did not ask for, and a build with no declared
 port prints no listener line at all (byte-identical to the single-listener banner). The paths
-named on that line are the ones mounted there: the four builtins are default-listener only,
+named on those lines are the ones mounted there: the four builtins are default-listener only,
 and so are every group that declares no port.
 
 A `--addr 127.0.0.1` start replaces the `other devices:`/`note:` pair with
 `other devices: none - bound to 127.0.0.1 (loopback only)` and a
 `next: --addr 0.0.0.0 (the default) publishes :8000 on every interface` hint; the
-`listener 8010:` line still follows, because an extra listener is bound on the same
+`listener 8010:` and `listener 8800:` lines still follow, because extra listeners are bound on the same
 address the default listener was given. A declared port that equals the port this process
 binds is a startup refusal with exit `1` naming both sides — two listeners cannot share one
 socket, and the fix is `--port` or the route file, never a silent choice by the server.
 
 Exit codes: `0` clean shutdown (Ctrl+C, SIGTERM on unix, after draining in-flight
 requests), `1` could not serve, `2` bad usage (`--help` prints usage and exits `0`).
-`--help` documents the same posture offline (`WHERE IT ANSWERS` / `SECURITY`).
+`--help` documents the same posture offline (`WHERE IT ANSWERS` / `SECURITY` /
+`WHAT IT PRINTS`).
+
+### What a running server prints
+
+After the banner, one line per request that reaches a matched route — written *before* the
+route runs, so a handler that hangs, panics or answers `404` has produced the line already —
+on **stdout**, untagged and untimestamped: the line `@underload/service` prints as the first
+statement of every endpoint handler
+(`packages/underload/service/src/server/start.ts:801-803`), and the line this server used not
+to print at all:
+
+```text
+Incoming request: [GET] http://127.0.0.1:8000/v1/services/health
+Incoming request: [GET] http://127.0.0.1:8010/v1/services/health
+Incoming request: [POST] http://127.0.0.1:8800/providers/private/v1/chat/completions
+```
+
+The authority is the one the client dialed (`Host`), so a declared listener prints its own
+port, and the query is kept exactly as it arrived. The rules — pinned by `tests/logging.rs`
+against a real socket, by `tests/server_process.rs` against the real executable's own stdout,
+and stated in `--help` — are the TypeScript's, except the upgrade row, which is a Rust-side
+decision (that row says why):
+
+| Request | Line? | Why |
+| --- | --- | --- |
+| a path this listener mounts, answered by its route | one | the route matched, and the TypeScript's log statement is inside that handler |
+| the same path, wrong verb (`405` + `allow`) | one | the path is mounted; `MethodRouter` wraps its verb fallback too, so the request did reach the matched route |
+| a `404` the handler itself chose to answer | one | a route matched — the handler's first statement still ran on the TypeScript side |
+| a CORS preflight (`OPTIONS` + `Access-Control-Request-Method`) | none | the gateway answers `204` before routing, so no route was ever matched |
+| a path this listener does not mount (the router's own `404`) | none | same decision as the TypeScript: no matched handler, nothing to log |
+| a `harness.v1` WebSocket upgrade | one | **not parity — a deliberate Rust-side decision**: on this server the upgrade is a single request through the router (the frames after it never re-enter it), while the TypeScript prints NOTHING for one, because it takes upgrades on the raw `http.Server` `upgrade` event, where "no Hono handler, no middleware" run (`packages/underload/service/src/server/start.ts:955-958`, `968-989`) |
+
+The four framework builtins (`/`, `/playground.css`, `/playground.js`, `/v1/services/routes`)
+are matched routes of the default listener too, so they are logged like any endpoint — one
+volume difference follows: opening the playground in a browser prints **four** lines here,
+where the TypeScript gateway prints none, because a page load reaches no endpoint handler and
+no upgrade on either side. The four are exactly what that page load asks for: the document
+(`GET /`), its two embedded assets (`GET /playground.css` and `GET /playground.js`, which the
+document references by path at `src/server/playground.html:23,156`), and the listing
+`GET /v1/services/routes` — `src/server/playground.js:1183` calls `loadEndpoints()` as soon as
+the script parses; that fetch of `ROUTE_METADATA_URL` (`playground.js:36`, issued at `:355`) is
+the only request the page makes without a click. There is no fifth line: the favicon is a data
+URI (`src/server/playground.html:22`), so it costs no request. The behaviour is kept on purpose
+(a request that reached a route is reported, whoever wrote the route), and
+`RUST_LOG=typecrate_services::request=off` is the switch that drops exactly those lines while
+`info` keeps the rest.
+
+Everything else the process reports is a `tracing` event (`src/logging.rs`), rendered as
+`<LEVEL padded to 5> <target>: <message> [<name>=<value> ...]` — the level is fixed-width so
+the targets line up (`INFO `, `WARN `, and five characters for `ERROR`/`DEBUG`/`TRACE`), and
+the trailing `name=value` pairs are the fields the event carried. The compiled-in provider
+surface now talks on this machine — its per
+completion token line, `[failover] … -> …`, `[retry] HTTP 429 rate limited — waiting 3000ms
+before retrying`, a `WARN  typecrate_provider::serve: provider route refused: …` while the
+vault is down, and `ERROR … request error in …` — where before this release every one of
+those lines was dropped by `tracing`'s default `NoSubscriber`.
+
+One knob, `RUST_LOG`, decides all of it (default `info`): `off|none|error|warn|info|debug|
+trace`, optionally scoped to a target prefix. A spec is a **comma-separated list** of such
+items, and the parser is deliberately tolerant about the list: whitespace around an item is
+trimmed and an empty item (`info,,debug`) is skipped, a bare level sets the process-wide level
+and the **last bare level in the list wins**, `=<level>` with no prefix is that same
+process-wide level rather than a prefix matching every target, and a prefixed item caps only
+the events whose target *starts with* it (module paths, so `typecrate_provider` covers
+`typecrate_provider::serve`), and when two prefixes both match one target the **longest** one
+wins (`src/logging.rs:154-170`) — `RUST_LOG=trace,typecrate_provider=warn,`
+`typecrate_provider::serve=error` caps `typecrate_provider::serve` at `error`, keeps `warn` for
+the rest of `typecrate_provider`, and leaves every other target at `trace`. `RUST_LOG=debug` or
+`RUST_LOG=typecrate_provider=trace`
+is how a provider conversation is watched; `RUST_LOG=warn` or `RUST_LOG=off` is the quiet
+start, because the per-request line is an info-severity event like any other. To keep `info`
+and drop only the request line: `RUST_LOG=typecrate_services::request=off`. A directive the
+parser cannot read is named on stderr and ignored — as is a value that is not valid text —
+never a panic, and never a silent change
+of verbosity — and a log line can never stop the server: a write failure (a closed stdout)
+is dropped rather than raised, which under `panic = "abort"` would otherwise take the process
+down over a log line.
+
 
 **Two different roots, on purpose.** The *scanner* root (where `*-route.rs` files
 live, see below) and the *data* root (where endpoints create their own
@@ -211,13 +299,17 @@ into the binary, so a cached copy is a different version of the tool),
 second origin — the playground therefore works on a LAN with no internet, and a
 response body full of markup is displayed as text rather than executed.
 
-The listing is the compiled-in set only, so today it is nineteen rows: the three `ANY`
-rows of the [harness gateway](#harness-gateway-v1harness) plus this package's fifteen sample
-routes — the two `echo` ones, `health`, and the six routes each REST sample compiles in
-(`locations` and `pets`, one row per `GET`/`POST`/`GET`/`PUT`/`PATCH`/`DELETE`) — plus the
-one demo row that declares a port: `health` is written twice in its route file, once for the
-default listener and once with `, port: 8010`, and the listing is **not filtered by port**, so
-one row per mounted `(method, path, port)` means that path legitimately appears twice. Every other
+The listing is the compiled-in set only, so today it is twenty-three rows: the three `ANY`
+rows of the [harness gateway](#harness-gateway-v1harness), the four `ANY` rows of the provider
+bridge (`packages/typecrate/provider/endpoint/provider/provider-route.rs`, whose contract lives in
+`packages/typecrate/provider`) — which come SECOND because that route file sorts between the harness
+and this package — plus this package's fifteen sample routes: the two `echo` ones, `health`, and the
+six routes each REST sample compiles in (`locations` and `pets`, one row per
+`GET`/`POST`/`GET`/`PUT`/`PATCH`/`DELETE`) — plus the rows that declare a port, which is five of the
+twenty-three: all four provider rows carry `, port: 8800`, and `health` is written twice in its route
+file, once for the default listener and once with `, port: 8010`. The listing is **not filtered by
+port**, so one row per mounted `(method, path, port)` means that `health` path legitimately appears
+twice. Every other
 `@underload/service` endpoint is still only on the TS gateway. Its rows are
 **generated**, not hand-maintained: each route file declares its endpoints once through
 `crate::service_routes!`, which emits both the `register` fn and that module's
@@ -237,6 +329,10 @@ the text its route file declares:
 [{"method":"ANY","path":"/v1/harness","summary":"Underload harness service document"},
 {"method":"ANY","path":"/v1/harness/stream","summary":"Underload harness realtime stream (harness.v1 WebSocket)"},
 {"method":"ANY","path":"/v1/harness/{*rest}","summary":"Underload harness API resources"},
+{"method":"ANY","path":"/providers/private/v1/chat/completions","summary":"OpenAI-compatible chat completions relay","port":8800},
+{"method":"ANY","path":"/providers/private/v1/responses","summary":"OpenAI-compatible responses relay","port":8800},
+{"method":"ANY","path":"/providers/private/v1/models","summary":"List the served model catalog","port":8800},
+{"method":"ANY","path":"/providers/private/v1/stats","summary":"Report provider token stats, or reset one model's stats","port":8800},
 {"method":"POST","path":"/v1/services/echo","summary":"Echoes the posted `value` unchanged"},
 {"method":"GET","path":"/v1/services/echo/{value}","summary":"Echoes `{value}`, with `?prefix=` applied"},
 {"method":"GET","path":"/v1/services/health","summary":"Reports the service name and version"},
@@ -256,12 +352,14 @@ the text its route file declares:
 ```
 
 The order is the scanner's byte-wise order of the route files, so
-`packages/typecrate/harness/endpoint/harness/harness-route.rs` comes first (T6), then
+`packages/typecrate/harness/endpoint/harness/harness-route.rs` comes first (T6), then the second
+foreign tree `packages/typecrate/provider/endpoint/provider/provider-route.rs`, then
 `endpoints/echo/echo-route.rs`, `health-route.rs`, `locations-route.rs` and `pets-route.rs` — the
 `*-core.rs` files sitting next to them are never scanned, so they cannot change this order; inside
 one route file it is the order of the `crate::service_routes!` groups, and inside a group the order
 of its verbs — which is why the two `health` rows sit next to each other, the unported one first.
-The `port` key appears on exactly one row, last, and never as `"port": null`: a group that declares
+The `port` key appears on five rows (the four provider rows and the second `health` one), always
+last, and never as `"port": null`: a group that declares
 no port simply omits the key (`EndpointMeta`'s last field carries
 `skip_serializing_if = "Option::is_none"`, so no pre-port row changed shape). And the set is not
 only prose: `scripts/check-playground.ts` pins it row-by-row in rail order (`LISTING_JSON`), so
@@ -279,7 +377,7 @@ key. It is an ordered array with no merge and no last-write-wins, so both declar
 published verbatim, in declaration order, and what tells them apart is the `port` key plus their
 deliberately different summaries. The listing is also **not scoped to a listener** — it describes
 every listener the process compiles in, while being mounted only on the default one — so "what
-runs on 8010" is a filter on the `port` key, not a per-port document. Per-port `servers` entries
+runs on 8010" or "what runs on 8800" is a filter on the `port` key, not a per-port document. Per-port `servers` entries
 were considered and rejected: they would mean inventing an OpenAPI document this service does not
 have, rather than describing the one it does. `tests/server_http.rs` pins the settlement exactly:
 both rows as full tuples in declaration order, and no
@@ -763,7 +861,7 @@ the route file carries the macro.
    the playground rail with nothing else touched.
 
 **What the split does not change is the wire surface.** The `*-route.rs` rename and the
-two-file layout are purely internal file organisation: the nineteen listing rows documented in
+two-file layout are purely internal file organisation: the twenty-three listing rows documented in
 [Where the server answers](#where-the-server-answers), the listing endpoint itself, every
 method, path, status and summary, and every REST rule documented in
 [Endpoints as they behave on the wire](#endpoints-as-they-behave-on-the-wire) are identical
@@ -1010,16 +1108,19 @@ with `cargo generate-lockfile`.
 
 This milestone is the framework, not the migration:
 
-- **No TypeScript endpoint has been ported** except one. The `GET`/`POST`-style documented
-  routes — nineteen listing rows: three `ANY` rows of the harness bridge, fifteen sample routes,
-  and the second `health` row that declares port `8010` — are the package's own samples
+- **No TypeScript endpoint has been ported** except two. The `GET`/`POST`-style documented
+  routes — twenty-three listing rows: three `ANY` rows of the harness bridge, four `ANY` rows of
+  the provider bridge, fifteen sample routes, and the second `health` row that declares port
+  `8010` — are the package's own samples
   (`examples/endpoints/**`), and the two REST
   samples are toy CRUD written to demonstrate the framework, not a port of anything. The
   `@underload/service` catalogue (comfy, database, preferences, …) still runs on the TS gateway,
-  which stays untouched. `harness` is the exception: its Rust port lives in
-  `packages/typecrate/harness` and reaches the wire through the discovered bridge described in
+  which stays untouched. `harness` and `provider` are the exceptions: their Rust ports live in
+  `packages/typecrate/harness` and `packages/typecrate/provider` and reach the wire through the
+  discovered bridges described in
   [Harness gateway](#harness-gateway-v1harness) — the gateway serves `/v1/harness`, the TS harness
-  package is still its own host.
+  package is still its own host, and the TS `packages/agentic/provider` (whose `/providers/private/v1`
+  contract the Rust provider reproduces) stays in place and untouched as well.
 - **Several listeners, one process, no redirect.** A route group may name its own listener with
   the trailing `, port:` slot, and the bin binds one listener per distinct declared port beside
   its default one (`server::declared_ports()` → `server::app_for`), each serving only the groups

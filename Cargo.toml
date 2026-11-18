@@ -78,6 +78,38 @@ serde_json = "1"
 # here. The edge points one way only: `typecrate-harness` has no dependency on services (its
 # manifest lists no path dependencies at all), so this cannot form a cycle.
 typecrate-harness = { path = "../harness" }
+# C4: the `/providers/private/v1` surface. `packages/typecrate/provider/endpoint/provider/provider-route.rs`
+# is a discovered route file, i.e. a module of THIS crate, and it calls
+# `typecrate_provider::serve::{chat_completions, responses, models, stats}` - so the provider
+# library has to link here. The edge points one way only: `typecrate-harness` above is the only
+# path dependency the provider manifest lists (services is not in it), so this cannot form a cycle.
+#
+# The dependency is a plain path dependency with NO features and NO `default-features = false`: the
+# provider crate declares no cargo features at all, and its surface here is only the `serve` module,
+# which needs nothing beyond the provider crate's own runtime deps (reqwest/serde_json/tokio/
+# tokio-util/futures-util - all already in this graph at the same versions, which is why adding this
+# line adds no new crate to `Cargo.lock`, only the two path entries).
+typecrate-provider = { path = "../provider" }
+# The log surface (the "output all logs" half of this crate). `tracing` is here because the
+# `typecrate-provider` tasks this binary links already log through its facade
+# (`provider/src/serve.rs` / `client.rs` / `transport.rs` / `vault.rs`) and, with NO
+# `tracing::Subscriber` installed anywhere in the process, every one of those events was being
+# thrown away. `src/logging.rs` installs the subscriber; `src/server/request_log.rs` emits the
+# gateway's per-request line through the same facade.
+#
+# `default-features = false, features = ["std"]` is the provider's recipe verbatim
+# (`packages/typecrate/provider/Cargo.toml:83`) and it is load-bearing offline: tracing's DEFAULT
+# feature set includes `attributes`, the only thing that pulls `tracing-attributes`, which appears
+# in NEITHER sibling lockfile (axum and tokio ask for `tracing` with `default-features = false`).
+# This workspace has no vendored registry, so a feature set that adds a package the cargo cache has
+# never downloaded cannot be resolved here at all.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# Declared directly because `src/logging.rs` IMPLEMENTS the subscriber trait: `Subscriber`,
+# `Metadata`, `Event`, `LevelFilter`, `span::*` and `field::Visit` are all `tracing-core` items
+# that `tracing` only re-exports. Naming the crate is what keeps that implementation's types
+# resolvable if a future `tracing` release reshuffles its re-export list, and it adds no crate
+# either: `tracing` already resolves `tracing-core` 0.1.36 in this lock.
+tracing-core = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # tests/server_http.rs dials the real listener over a real TCP socket; no stubbed

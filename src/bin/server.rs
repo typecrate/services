@@ -30,7 +30,7 @@
 // Native runtime.
 // ---------------------------------------------------------------------------
 mod native {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::io::ErrorKind;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
     use std::path::{Path, PathBuf};
@@ -38,6 +38,7 @@ mod native {
     use tokio::net::TcpListener;
     use tokio::sync::watch;
     use tokio::task::JoinSet;
+    use typecrate_services::logging::{self, LEVEL_ENV};
     use typecrate_services::server::{
         AppState, MAX_REQUEST_BODY_BYTES, app_for, declared_ports, default_database_root,
         normalize_lexically,
@@ -113,6 +114,28 @@ OPTIONS:
 ENVIRONMENT:
     TYPECRATE_SERVICES_ADDR            same meaning as --addr
     TYPECRATE_SERVICES_DATABASE_ROOT   same meaning as --database-root
+    RUST_LOG                           log verbosity: off|none|error|warn|info|
+                                       debug|trace, optionally scoped to a target
+                                       prefix (`typecrate_provider=trace`). A spec is a
+                                       comma-separated list of such items: whitespace
+                                       around an item is trimmed and an empty item
+                                       (`info,,debug`) is skipped, a bare level sets the
+                                       process-wide level and the LAST bare level in the
+                                       list wins, `=<level>` with no prefix is that same
+                                       process-wide level, and a prefixed item caps only
+                                       the events whose target STARTS with it
+                                       (`typecrate_provider` covers
+                                       `typecrate_provider::serve`), and when two
+                                       prefixes both match one target, the LONGEST one wins
+                                       (`RUST_LOG=trace,typecrate_provider=warn,
+                                       typecrate_provider::serve=error` caps that target
+                                       at error and keeps warn for the rest of
+                                       typecrate_provider, leaving every other target at
+                                       trace). An item the parser
+                                       cannot read - including a value that is not valid
+                                       text - is named on stderr and ignored. Default
+                                       info. WHAT IT PRINTS below says what each
+                                       setting does to the per-request line.
 
 Precedence per setting: CLI flag, then environment variable, then built-in default.
 Exit codes: 0 clean shutdown, 1 could not serve, 2 bad usage.
@@ -160,6 +183,40 @@ WHERE IT ANSWERS (framework builtins of the DEFAULT listener, not endpoint route
     then wins the connections for that interface, so the older server keeps the LAN and
     this one serves loopback. Run parallel instances on distinct --port values unless
     that shadowing is what you want.
+
+    WHAT IT PRINTS:
+    The banner above, then one line per event for as long as the process runs:
+
+        Incoming request: [GET] http://127.0.0.1:8000/v1/services/health
+
+    That is the per-request line: one per request a route MATCHED, written BEFORE the
+    route runs (so a handler that hangs, panics or answers 404 has produced it already),
+    on EVERY listener this process holds (the default one and each port a route file
+    declared), on stdout, untagged and untimestamped - the same line, and the same
+    position in the stream, as the @underload/service gateway prints before an endpoint
+    runs. A CORS preflight (answered before routing) and a path this listener does not
+    mount (its plain 404) print no line; a path mounted but not for that verb (405 +
+    allow) and a handler's own 404 do print one, because a route was matched. A WebSocket
+    upgrade logs once, for the upgrade request - frames are not requests. That line is a
+    Rust-side decision rather than parity: the TypeScript host takes upgrades on the raw
+    http.Server `upgrade` event, where no handler and no middleware run at all
+    (packages/underload/service/src/server/start.ts:955-958, 968-989), so its log
+    statement never fires for a handshake.
+
+    Everything else is a `tracing` event at the level RUST_LOG sets (default info),
+    printed as `<LEVEL padded to 5> <target>: <message> [<name>=<value> ...]` - the level
+    is fixed-width so the targets line up, and the trailing `name=value` pairs are the
+    fields the event carried (`TRACE typecrate_provider::vault: vault artifact accepted
+    vendors=3`). That is what makes the compiled-in provider surface on port 8800 talk
+    at all: its per-completion token line, [failover] ..., [retry] HTTP 429 rate limited
+    ..., a route refused while the vault is down (warn) and every error are on by
+    default, while its debug request-body diagnostics and its trace vault line are not.
+    Raise them with RUST_LOG=debug or RUST_LOG=trace, or for one crate only with
+    RUST_LOG=typecrate_provider=trace. The per-request line is an INFO-severity event,
+    so the same knob covers it: it prints at info, debug and trace, and RUST_LOG=warn,
+    error or off is the quiet start. To keep info and drop only the request line, name
+    its target: RUST_LOG=typecrate_services::request=off. A log line can never stop the
+    server: a write failure (a closed stdout) is dropped, not panicked.
 
 SECURITY:
     Requests are unauthenticated and there is no Origin/CORS gate yet, so publish
@@ -209,6 +266,14 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             return EXIT_OK;
         }
 
+        // The log surface goes in before anything else can emit. Two independent reasons:
+        // without a `tracing::Subscriber` in this process, `tracing`'s default `NoSubscriber`
+        // drops EVERY event - the provider's token/`[failover]`/`[retry]`/vault lines this
+        // binary links, and this crate's own per-request line - which is exactly the silence
+        // `yarn start-rust` used to print after its banner; and a subscriber installed after the
+        // first requests have arrived would miss them.
+        install_logger();
+
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -220,6 +285,53 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             }
         };
         runtime.block_on(serve(config))
+    }
+
+    /// Installs the process-wide subscriber: the one place in the binary that reads
+    /// `RUST_LOG`, and the one that decides what a start prints.
+    ///
+    /// The subscriber goes up before the runtime is built, so a later `set_var` cannot change
+    /// what this process prints and no event can be emitted into the default `NoSubscriber`.
+    /// A value `install` rejects (it parses, it never panics) is reported on stderr and the
+    /// default `info` filter runs anyway - the server's contract is "a bad knob is an error on
+    /// stderr", never "a bad knob silently changes verbosity", and never a panic (this profile
+    /// builds `panic = "abort"`).
+    fn install_logger() {
+        // `var_os` rather than `var`, because of the contract in the paragraph above: `var`
+        // reports a value that is not valid UTF-8 as `Err(NotUnicode)`, and `.ok()` would turn
+        // "the operator set an unreadable knob" into "the knob is unset" - the default filter
+        // with NO notice on stderr, which is exactly the silent change that contract rules out.
+        // `var_os` keeps the bytes, so the three cases stay distinguishable here.
+        let raw = std::env::var_os(LEVEL_ENV);
+        let spec = match raw.as_deref().map(OsStr::to_str) {
+            // Set and decodable: the parse below decides which ITEMS it cannot read.
+            Some(Some(spec)) => Some(spec),
+            // Set but undecodable: reported like an unreadable directive, then the default
+            // filter runs and the process keeps serving.
+            Some(None) => {
+                eprintln!(
+                    "typecrate-services-server: ignoring the unreadable {LEVEL_ENV} value - it \
+                     is not valid text (expected a level, or target=level)"
+                );
+                None
+            }
+            // Unset: no notice, default filter, which is what the flag-less start means.
+            None => None,
+        };
+        match logging::install(spec) {
+            Ok(filter) => {
+                // Every directive the spec contains but the parser could not read: named,
+                // because a typo in a log filter is otherwise invisible until the log that
+                // should have been quieter turns out to be unchanged.
+                for ignored in filter.ignored() {
+                    eprintln!(
+                        "typecrate-services-server: ignoring the unreadable {LEVEL_ENV} \
+                         directive \"{ignored}\" (expected a level, or target=level)"
+                    );
+                }
+            }
+            Err(message) => eprintln!("typecrate-services-server: {message}"),
+        }
     }
 
     /// Environment + CLI in one place; the two sources are then handed to the pure
@@ -912,6 +1024,9 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
     mod tests {
         use super::*;
         use std::path::PathBuf;
+        // The prefix the request-log layer prints, imported here (not in `native`) because only
+        // these tests compare it against what `--help` promises.
+        use typecrate_services::server::REQUEST_LOG_PREFIX;
 
         /// `&[&str]` -> `Vec<OsString>`, i.e. what `std::env::args_os` would hand main.
         fn owned(args: &[&str]) -> Vec<OsString> {
@@ -1138,6 +1253,93 @@ stops on Ctrl+C (and SIGTERM on unix) after draining in-flight requests.";
             // The IPv6 host form the parser accepts is spelled out where a human reads
             // it, and it is the same message `parse_addr` produces on a bad value.
             assert!(HELP.contains("[::1] or [::1]:8000"));
+        }
+
+        #[test]
+        fn help_lists_every_variable_the_binary_reads() {
+            // The third channel of the contract: `--help` names every variable this binary
+            // reads, so a stale `HELP` string is a test failure rather than an undocumented
+            // feature. `LEVEL_ENV` is interpolated rather than typed: renaming the constant
+            // stops compiling, and a literal that drifts from it fails here.
+            assert!(HELP.contains("TYPECRATE_SERVICES_ADDR"));
+            assert!(HELP.contains("TYPECRATE_SERVICES_DATABASE_ROOT"));
+            assert!(HELP.contains(&format!("    {LEVEL_ENV} ")));
+        }
+
+        #[test]
+        fn help_documents_every_line_a_start_prints() {
+            // `WHAT IT PRINTS` is the log contract an operator reads, so each rule it states
+            // is pinned: the exact per-request line, the listeners it appears on, the
+            // requests that print nothing, the events the binary used to drop, and the one
+            // knob that decides all of it. A reworded section that loses a sentence loses
+            // documented behaviour, and this is what catches that.
+            //
+            // The line itself, spelled exactly as `request_log_line` builds it.
+            assert!(
+                HELP.contains("Incoming request: [GET] http://127.0.0.1:8000/v1/services/health")
+            );
+            // The line is written BEFORE the route runs, not after it answered: `log_request`
+            // emits first and only then calls `next.run`, so a handler that hangs or 404s has
+            // produced the line already (see `src/server/request_log.rs:136-148`).
+            assert!(
+                HELP.contains(
+                    "one per request a route MATCHED, written BEFORE the\n    route runs"
+                )
+            );
+            // On every listener, not only the default one - the rule, not just the example.
+            assert!(HELP.contains("on EVERY listener this process holds"));
+            // The requests that print no line, and the two that print one despite the status.
+            assert!(HELP.contains("A CORS preflight (answered before routing)"));
+            assert!(HELP.contains("plain 404) print no line"));
+            assert!(HELP.contains("handler's own 404 do print one, because a route was matched"));
+            // The upgrade line, and the fact that it is NOT a parity claim: the TypeScript host
+            // never reaches its log statement for a handshake, because upgrades go to the raw
+            // `http.Server` event (`start.ts:955-958`), so this row is a Rust-side decision.
+            assert!(HELP.contains("upgrade logs once, for the upgrade request"));
+            assert!(HELP.contains("Rust-side decision rather than parity"));
+            // The provider events the subscriber exists to surface.
+            assert!(HELP.contains("[failover] ..."));
+            assert!(HELP.contains("[retry] HTTP 429 rate limited"));
+            // The record shape of every OTHER line, as `LogSubscriber::render` really prints it:
+            // a fixed-width level (so the targets line up) and the trailing `name=value` fields.
+            assert!(HELP.contains("<LEVEL padded to 5> <target>: <message> [<name>=<value> ...]"));
+            // The knob, its default, and how to silence one target while keeping the rest.
+            assert!(HELP.contains("(default info)"));
+            assert!(HELP.contains(&format!("{}=off", logging::REQUEST_TARGET)));
+            // The grammar `logging::Filter::parse` actually accepts, stated where an operator
+            // reads it: a comma-separated list, whitespace and empty items tolerated, the last
+            // bare level winning, an empty prefix falling back to the global level, prefixes
+            // matching by module-path prefix, and a bad item named on stderr instead of guessed.
+            assert!(HELP.contains("comma-separated list of such items"));
+            assert!(HELP.contains("an empty item"));
+            assert!(HELP.contains("(`info,,debug`) is skipped"));
+            assert!(HELP.contains("the LAST bare level in the"));
+            assert!(HELP.contains("`=<level>` with no prefix is that same"));
+            assert!(HELP.contains("whose target STARTS with it"));
+            // The tie-break `logging::Filter::allows` actually implements (longest matching
+            // prefix wins, `src/logging.rs:154-170`, behaviour pinned by
+            // `logging::tests::the_filter_allows_by_target_then_by_level`) is stated here too,
+            // because an operator writing a two-prefix spec needs to know which one applies.
+            assert!(HELP.contains("prefixes both match one target, the LONGEST one wins"));
+            assert!(HELP.contains("typecrate_provider::serve=error` caps that target"));
+            assert!(HELP.contains("including a value that is not valid"));
+        }
+
+        #[test]
+        fn the_request_line_is_a_route_layer_fact() {
+            // The rule the request log is built on, stated beside the code that enforces it.
+            // The prefix the layer prints is the TypeScript gateway's, byte for byte
+            // (`start.ts:803`), and it is the same constant the layer hands `tracing`.
+            assert_eq!(REQUEST_LOG_PREFIX, "Incoming request: ");
+            // A route file declares its port, and `serve` builds one `app_for` per listener, so
+            // each listener gets its own copy of the layer: the default listener and every
+            // declared port print the line for the requests that listener answers - which is
+            // what the banner promising every listener is backed by.
+            assert!(HELP.contains("The startup banner lists"));
+            // The line rides on the matched routes only, so the 404 fallback and the gateway
+            // answers (preflight, its own OPTIONS/HEAD) are outside it. `server::app_for` is
+            // where that mount is, and `tests/logging.rs` pins those three cases on the wire.
+            assert!(HELP.contains("one per request a route MATCHED, written BEFORE the"));
         }
 
         #[test]

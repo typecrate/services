@@ -62,6 +62,17 @@ use axum::routing::get;
 mod metadata;
 pub use metadata::EndpointMeta;
 
+// The gateway's per-request line (the `Incoming request: [GET] http://host/path` the TS host
+// prints at `start.ts:803`). It is a sibling file rather than a few lines in here because it is
+// a second contract of the same transport: its mount point is `app_for`, but its parity rules,
+// its URL-rebuilding rules and its tests are all its own (see that file's module doc).
+mod request_log;
+// The one piece of that contract that is observable from OUTSIDE this crate: the exact prefix,
+// so the binary's `--help` text and the integration tests can pin the same bytes the layer
+// prints instead of restating them. The line builder itself and `log_request` stay private - an
+// embedder gets the line by calling `app_for`, which is where the parity rules live.
+pub use request_log::REQUEST_LOG_PREFIX;
+
 /// Upper bound on a request body, applied as an axum layer so an oversized payload
 /// is refused (413) before any endpoint parses it. The contract endpoints exchange
 /// small JSON objects, and a POST body is attacker-controlled, so the cap is a
@@ -441,6 +452,14 @@ async fn gateway(request: Request, next: Next) -> Response {
 /// no route - generated, builtin or a future fallback - can escape the cross-origin
 /// header set, on the default listener or on a declared one.
 ///
+/// One more layer is mounted between those two, on every listener that has routes:
+/// [`request_log::log_request`] through `route_layer`, the TS-parity
+/// `Incoming request: [METHOD] URL` line (`start.ts:803`). `route_layer` - not `layer` - is
+/// what makes that line satisfy the parity rule "only for a request a route actually answered":
+/// it wraps the mounted routes and leaves the fallback alone, so an unmatched path stays
+/// unlogged, and sitting INSIDE the gateway layer keeps a preflight `204` unlogged as well. The
+/// exact rules, each with the axum source that produces it, are in `src/server/request_log.rs`.
+///
 /// The builtin browser surface is registered in the same position on purpose: the four
 /// routes above are added before `.layer(DefaultBodyLimit::max(..))`, so the one body
 /// cap covers them too and there is no route outside the limit.
@@ -477,9 +496,42 @@ pub fn app_for(port: Option<u16>, state: AppState) -> Router {
         router
     };
 
-    router
+    let router = router
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        .with_state(state)
+        .with_state(state);
+
+    // The per-request line (`src/server/request_log.rs`) rides on the MATCHED routes of THIS
+    // listener, and `route_layer` is the axum mechanism that means exactly that:
+    // `Router::route_layer` layers `path_router` and leaves both `fallback_router` and
+    // `catch_all_fallback` untouched (`axum-0.8.9/src/routing/mod.rs:321-335`), so a request for
+    // a path this listener does not mount is answered by the fallback `404` without ever
+    // producing a log line - the parity rule the TS host satisfies by logging inside an endpoint
+    // handler that only a matched route reaches.
+    //
+    // Two placements are load-bearing and both are visible here:
+    //
+    //   * it is INSIDE the `gateway` layer below, so a CORS preflight - answered by `gateway`
+    //     before the router is consulted - produces no line at all, while a bare `OPTIONS` is
+    //     still routed and still logged;
+    //   * it is OUTSIDE `DefaultBodyLimit` (added after it, therefore the outer one), so the
+    //     request path stays `gateway -> log -> body limit -> route` and the pinned `413`/`405`/
+    //     `404` answers of `tests/server_http.rs` come from the same chain they came from before:
+    //     `log_request` reads only the method and the URI, and hands the request and the response
+    //     to `Next` untouched.
+    //
+    // `has_routes` is the guard `route_layer` requires: a router built for a port nothing
+    // declared mounts ZERO routes, and axum panics on a layer with nothing to wrap
+    // (`axum-0.8.9/src/routing/path_router.rs:319-324`) - under `panic = "abort"` that panic
+    // would be the start of the process. A router with no routes answers every request with the
+    // fallback `404`, i.e. the one case this layer must not log anyway, so skipping the mount
+    // changes nothing observable.
+    let router = if router.has_routes() {
+        router.route_layer(middleware::from_fn(request_log::log_request))
+    } else {
+        router
+    };
+
+    router
         // Outermost, so a preflight is answered before the router is consulted AND
         // every response - including a `101` upgrade and a bare 404 - carries the
         // same four headers.
@@ -711,10 +763,15 @@ mod tests {
     /// (`examples/endpoints/health/health-route.rs`) - the pair this feature exists for.
     const SHARED_PATH: &str = "/v1/services/health";
 
-    /// The one port the tree declares, and a port NOTHING declares. 8011 appears in a
-    /// `service_routes!` probe inside `src/server/metadata.rs`'s own tests, which is not
-    /// part of the discovered table, so `declared_ports()` cannot report it.
+    /// The ports the tree declares (in ascending order, the order `declared_ports()`
+    /// promises): 8010 is the `examples/endpoints/health/health-route.rs` group, 8800 is the
+    /// four `/providers/private/v1` groups of the foreign route file
+    /// `packages/typecrate/provider/endpoint/provider/provider-route.rs`. `AN_UNDECLARED_PORT`
+    /// is a port NOTHING declares: 8011 appears in a `service_routes!` probe inside
+    /// `src/server/metadata.rs`'s own tests, which is not part of the discovered table, so
+    /// `declared_ports()` cannot report it.
     const DECLARED_PORT: u16 = 8010;
+    const PROVIDER_PORT: u16 = 8800;
     const AN_UNDECLARED_PORT: u16 = 8011;
 
     /// A data root that never has to exist: every request dialed below is a read, and the
@@ -795,15 +852,18 @@ mod tests {
     /// from: every ported row's port is in it, and the default listener is not.
     #[test]
     fn declared_ports_is_exactly_the_set_of_ports_the_route_tree_declares() {
-        // Today's tree declares exactly one port: the `port: 8010` group of
-        // `examples/endpoints/health/health-route.rs`. Adding or removing a `, port:`
-        // group is therefore an explicit edit here, not a silent drift.
-        assert_eq!(declared_ports(), vec![DECLARED_PORT]);
+        // Today's tree declares exactly two ports: the `port: 8010` group of
+        // `examples/endpoints/health/health-route.rs`, and the four `port: 8800` groups of the
+        // foreign route file `packages/typecrate/provider/endpoint/provider/provider-route.rs`.
+        // Adding or removing a `, port:` group is therefore an explicit edit here, not a silent
+        // drift. Ascending, because that is the order `declared_ports()` promises the bin binds.
+        assert_eq!(declared_ports(), vec![DECLARED_PORT, PROVIDER_PORT]);
         // Derived, and from the same table `GET /v1/services/routes` serialises.
         let rows = crate::route_metadata();
         assert_eq!(declared_ports(), ports_from_metadata(&rows));
-        // Exactly one row declares it; every other row belongs to the default listener,
-        // so nothing is served on a listener `declared_ports()` did not report.
+        // Exactly one row declares 8010 and exactly four declare 8800 (the provider mount lists
+        // one row per group); every other row belongs to the default listener, so nothing is
+        // served on a listener `declared_ports()` did not report.
         assert_eq!(
             rows.iter()
                 .filter(|row| row.port == Some(DECLARED_PORT))
@@ -811,8 +871,14 @@ mod tests {
             1
         );
         assert_eq!(
+            rows.iter()
+                .filter(|row| row.port == Some(PROVIDER_PORT))
+                .count(),
+            4
+        );
+        assert_eq!(
             rows.iter().filter(|row| row.port.is_none()).count(),
-            rows.len() - 1
+            rows.len() - 5
         );
     }
 
