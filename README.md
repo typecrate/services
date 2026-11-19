@@ -3,8 +3,10 @@
 Rust-first, native-only service core for the `typecrate` scope. The crate in this
 directory is the implementation; build / check / test / lint / run are all `cargo`
 (the npm scripts add the route-discovery pre-step through the root-hoisted
-`vite-node`). There is no wasm target and no JS entry point: the package is private
-and `package.json` exists so yarn/WebStorm can drive those scripts.
+`vite-node`, and the two verbs that **boot** the server chain one more pre-step that
+re-syncs the endpoint configuration it reads — see [Scripts](#scripts)). There is no
+wasm target and no JS entry point: the package is private and `package.json` exists
+so yarn/WebStorm can drive those scripts.
 
 Current phase: the service **framework** is in place — a runnable native HTTP
 executable, build-time route discovery, shared state, and a sample endpoint set of
@@ -41,6 +43,7 @@ packages/typecrate/services/
   tests/server_process.rs   # the executable as a process: the request line on ITS stdout, and RUST_LOG
   tests/server_http.rs      # real-TCP HTTP tests of the exact library router
   scripts/discover-services.ts # pre-step: tree-shape snapshot -> Temp/ watched file
+  scripts/sync-provider-vault.ts # pre-step: re-export the vault artifact the provider loads
   scripts/check-playground.ts  # optional jsdom check of the embedded browser surface
 ```
 
@@ -74,12 +77,14 @@ and `/` replaced by `-` (rust/README.md naming rule); in Rust code it is
 ## Native service
 
 ```bash
-yarn workspace @typecrate/services run-native    # discovery snapshot, then cargo run --bin typecrate-services-server --locked --
+yarn workspace @typecrate/services run-native    # discovery snapshot + vault artifact, then cargo run --bin typecrate-services-server --locked --
 yarn workspace @typecrate/services build         # discovery snapshot, then cargo build --release --locked -> the same executable
 ```
 
-`run-native` (alias: `start`) ends in a bare `--`, so anything after npm's own `--`
-separator reaches the executable:
+`run-native` (alias: `start`) chains both pre-steps first — the discovery snapshot and
+the vault re-sync ([Scripts](#scripts)) — and ends in a bare `--`. npm appends the
+forwarded flags after the **whole** script string, so neither pre-step can receive
+them and anything after npm's own `--` separator reaches the executable:
 
 ```bash
 npm start -- --port 4321 --database-root D:\data         # LAN-reachable on :4321
@@ -911,6 +916,12 @@ the explicit re-scan, neither of them a `cargo clean` and neither a daemon:
   and repeating the same value re-runs nothing. `npm run discover -- --force` rewrites
   the snapshot file for the same effect without an environment variable.
 
+This section tracks the **route table** only. The two verbs that boot the server,
+`start` and `run-native`, chain one more pre-step after this one,
+`vite-node scripts/sync-provider-vault.ts`, which keeps the endpoint
+**configuration** current instead: it is unrelated to the scan, touches none of the
+watches above, and re-runs nothing here (see [Scripts](#scripts)).
+
 The caveat that comes with a recursive directory watch: keep generated output out of
 `endpoint`/`endpoints` trees. The scanner prunes `node_modules`/`dist`/`target`/… from
 *discovery*, but cargo does not know those rules when it watches a tree, so an artifact
@@ -1089,10 +1100,11 @@ files compile into this crate.
 | Script | Command | Gate |
 | --- | --- | --- |
 | `discover` | `vite-node scripts/discover-services.ts` | native: rewrites the watched discovery snapshot (`--force`, `--print`) || `build` | `vite-node scripts/discover-services.ts && cargo build --release --locked` | native: rlib + the server executable |
-| `start`, `run-native` | `vite-node scripts/discover-services.ts && cargo run --bin typecrate-services-server --locked --` | native: forwards everything after `npm … --` |
+| `start`, `run-native` | `vite-node scripts/discover-services.ts && vite-node scripts/sync-provider-vault.ts && cargo run --bin typecrate-services-server --locked --` | native: re-syncs the vault artifact, then boots; forwards everything after `npm … --` |
 | `check` | `vite-node scripts/discover-services.ts && cargo check --workspace --all-targets --locked` | native |
 | `check:ui` | `vite-node scripts/check-playground.ts` | **optional**, JS: drives the embedded page in jsdom (the workspace root's copy; `--base <origin>` runs the same suite against a live server). Not part of `verify`, which stays JS-free |
 | `test` | `vite-node scripts/discover-services.ts && cargo test --workspace --locked` | native: unit + discovery + real-socket HTTP |
+| `test:scripts` | `vitest run scripts` | **JS**: the colocated scripts suite (`scripts/*.test.ts`, the vault pre-step's decision logic). `test` stays cargo — what turbo and CI reach — so this verb is the only way these tests run; like `check:ui`, it sits outside `verify` |
 | `lint` | `cargo clippy --workspace --all-targets --locked` | what root `turbo run test` executes; must not deny warnings |
 | `lint:strict` | the same with `-D warnings` | CI/verify gate (it lints the generated module too) |
 | `fmt`, `fmt:check` | `cargo fmt -p typecrate-services [-- --check]` | native |
@@ -1103,6 +1115,34 @@ workspace has its own lock; the root workspace keeps a separate one), so a build
 never re-resolves dependencies. If the lock is
 missing or predates a manifest change, cargo stops and you regenerate on purpose
 with `cargo generate-lockfile`.
+
+`start` and `run-native` run one pre-step beyond discovery, `scripts/sync-provider-vault.ts`,
+and it is the one the stale-endpoint report came from: this server's endpoint
+configuration is **derived output, not a source**. The compiled-in provider never
+reads `config/vault/src/**` — it loads
+`config/vault/generated/agentic-provider.json`, the git-ignored artifact
+`config/vault/scripts/export-vault.ts` writes, exactly once per process
+(`packages/typecrate/provider/src/serve.rs:192-195` `DEFAULT_VAULT_ARTIFACT`,
+`serve.rs:415-436` `OnceLock`). Nothing used to run that export automatically, so a
+fresh start served the endpoint pool of the **last** export however much the vault had
+changed since — a stale derived artifact, not a cache. The pre-step regenerates it
+before cargo runs, with exactly the command the Rust refusal prints
+(`serve.rs:200-201` `REGENERATION_COMMAND`, `--consumer agentic-provider`) and with
+two flags left out on purpose: no `--check` (a fresh clone has no `generated/`, where
+`--check` reports `missing` and exits 1 — the plain export creates the file instead),
+no `--public-only` (it strips every secret slot into the same path). The exporter is
+pure and write-if-changed (`config/vault/scripts/export-vault.ts:445-450`), so a
+current tree costs one child process and leaves the artifact's mtime untouched.
+
+The exit codes are the point: **0** when `config/vault/package.json` is absent —
+a standalone/cargo-only checkout of this package ships no vault toolchain at all, so
+the step prints one line and cargo proceeds — and **1** when the vault **is** present
+and the export fails, which stops the `&&` chain before cargo can bind a port on a
+known-stale artifact: a fresh `start` can therefore never boot on endpoint
+configuration the vault has changed under it. `build`, `check`, `test`, `verify` and
+`check:ui` deliberately do not run it, because none of them boots a server that reads
+the artifact. How the vault itself works — scopes, consumers, the artifact shape — is
+`config/vault/knowledge.md`'s territory, not this README's.
 
 ## Scope and parity gaps
 
