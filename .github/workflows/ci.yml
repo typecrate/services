@@ -1,0 +1,93 @@
+# Runs this package's test suite on GitHub.
+#
+# WHY THE WORKFLOW LIVES HERE (not in the noobscript monorepo root):
+# packages/typecrate/services is its own git repository (origin
+# typecrate/services). Inside the monorepo it is an embedded repo, so the root
+# repository never sees anything under it and a root-level workflow could not
+# trigger on these files; GitHub Actions reads .github/workflows/ from the root
+# of THIS repository only. The sibling typecrate packages ship their own
+# workflows the same way.
+#
+# WHAT RUNS: `npm test`, the package's declared test entry point
+# (`package.json` -> `vite-node scripts/discover-services.ts && cargo test
+# --workspace --locked`), so CI runs exactly what a developer runs locally,
+# discovery pre-step included.
+#
+# SIBLING CHECKOUTS: `Cargo.toml` declares path dependencies on `../harness` and
+# `../provider` (their route files are compiled into this crate), and
+# `scripts/discover-services.ts` resolves the repository root as three parents
+# above the package (`<repo>/packages/<scope>/<name>`). Both are satisfied by
+# checking the two sibling repositories out at the same relative paths they
+# have inside noobscript. They are public, so the default GITHUB_TOKEN can read
+# them.
+#
+# VITE-NODE: the `test` script starts with the discovery pre-step, which runs
+# `vite-node`. Inside noobscript that binary is hoisted to the workspace root;
+# this standalone repository declares no npm dependencies at all, so CI installs
+# it with `--no-save` (the manifest and a lockfile stay untouched).
+#
+# TOOLCHAIN: noobscript pins 1.99.1 in its root rust-toolchain.toml, which a
+# standalone checkout does not carry (this repository IS the package), so the
+# same version is installed explicitly below.
+
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - name: Checkout services
+              uses: actions/checkout@v5
+              with:
+                  path: packages/typecrate/services
+
+            - name: Checkout harness (../harness path dependency)
+              uses: actions/checkout@v5
+              with:
+                  repository: typecrate/harness
+                  path: packages/typecrate/harness
+
+            - name: Checkout provider (../provider path dependency)
+              uses: actions/checkout@v5
+              with:
+                  repository: typecrate/provider
+                  path: packages/typecrate/provider
+
+            - name: Setup Node
+              uses: actions/setup-node@v5
+              with:
+                  node-version: 24
+
+            - name: Install Rust 1.99.1
+              run: |
+                  rustup toolchain install 1.99.1 --profile minimal
+                  rustup default 1.99.1
+
+            - name: Cache cargo
+              uses: actions/cache@v6
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      packages/typecrate/services/target
+                  key: ${{ runner.os }}-cargo-${{ hashFiles('packages/typecrate/services/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-
+
+            - name: Install vite-node (discovery pre-step)
+              working-directory: packages/typecrate/services
+              run: npm install --no-save --no-package-lock vite-node@6
+
+            - name: Test
+              working-directory: packages/typecrate/services
+              run: npm test
