@@ -16,7 +16,7 @@
 //! This standalone workspace has no vendored registry (`provider/knowledge.md:74-85`), the host
 //! cannot reach `index.crates.io`, and `tracing-subscriber` / `matchers` / `nu-ansi-term` /
 //! `sharded-slab` / `env_logger` are all absent from `Cargo.lock` (they exist only in the
-//! unrelated `services/nexus/Cargo.lock`). `tracing` 0.1.44 and `tracing-core` 0.1.36 are
+//! unrelated `packages/typecrate/nexus/Cargo.lock`). `tracing` 0.1.44 and `tracing-core` 0.1.36 are
 //! already in it, so the subscriber below is written against those two crates only. The
 //! provider's own lock-subset test (`provider/tests/transport.rs:2749-2795`) requires the
 //! provider package set to stay a subset of this one, which is why the new edges are declared
@@ -62,7 +62,7 @@ use tracing_core::{Event, Level, Metadata};
 pub const REQUEST_TARGET: &str = "typecrate_services::request";
 
 /// The environment variable that controls verbosity. `RUST_LOG` is the name the only other Rust
-/// server in this repo honours (`services/nexus/crates/nexus-server/src/main.rs:44-53`), so
+/// server in this repo honours (`packages/typecrate/nexus/crates/nexus-server/src/main.rs:44-53`), so
 /// there is one spelling of this knob across the repo rather than two.
 pub const LEVEL_ENV: &str = "RUST_LOG";
 
